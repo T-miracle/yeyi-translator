@@ -6,8 +6,13 @@ import {
   LANGUAGES,
 } from "../shared/settings.js";
 import { translateBatch, listModels, TranslationError } from "./api.js";
+import { TranslationCache, translateWithCache, lookupCachedTranslations } from "./cache.js";
+import { NameDictionary } from "./name-dictionary.js";
+import { nameDictionarySignature } from "../shared/name-dictionary.js";
 
 const inflight = new Map();
+const cache = new TranslationCache();
+const nameDictionary = new NameDictionary();
 let settingsQueue = Promise.resolve();
 const ready = initialize();
 
@@ -22,7 +27,12 @@ async function initialize() {
 async function getSettings() {
   await ready;
   const { settings } = await chrome.storage.local.get("settings");
-  return normalizeSettings(settings);
+  const dictionary = await nameDictionary.read();
+  return {
+    ...normalizeSettings(settings),
+    nameDictionary: dictionary.enabled ? dictionary.entries : [],
+    nameDictionarySignature: await nameDictionarySignature(dictionary),
+  };
 }
 
 /** 限制密钥读写只能来自扩展自己的设置或弹窗页面。@param {Object} sender 消息来源。@returns {void} 无返回值。 */
@@ -41,12 +51,22 @@ async function updateSettings(update) {
     .then(async () => {
       const current = await getSettings();
       const next = normalizeSettings(update(current));
+      if (current.cacheEnabled !== next.cacheEnabled) cache.invalidate();
       await chrome.storage.local.set({ settings: next });
-      await broadcastSettings(publicSettings(next));
-      return publicSettings(next);
+      const config = publicSettings(await getSettings());
+      await broadcastSettings(config);
+      return config;
     });
   settingsQueue = task;
   return task;
+}
+
+/** 字典提交成功后再通知网页重译；旧请求不会写入当前轮缓存，不删除原有缓存数据。 */
+async function updateNameDictionary(work) {
+  const result = await work();
+  cache.invalidate();
+  await broadcastSettings(publicSettings(await getSettings()));
+  return result;
 }
 
 /** 通知所有已打开的网页刷新公开偏好。@param {Object} config 脱敏配置。@returns {Promise<void>} 发送结束。 */
@@ -155,7 +175,19 @@ async function handleMessage(message, sender) {
       return publicSettings(await getSettings());
     case "GET_SETTINGS":
       requireTrusted(sender);
-      return getSettings();
+      return normalizeSettings(await getSettings());
+    case "GET_NAME_DICTIONARY":
+      requireTrusted(sender);
+      return nameDictionary.read();
+    case "IMPORT_NAME_DICTIONARY":
+      requireTrusted(sender);
+      return updateNameDictionary(() => nameDictionary.importData(message.entries));
+    case "SAVE_NAME_ENTRY":
+      requireTrusted(sender);
+      return updateNameDictionary(() => nameDictionary.saveEntry(message.entry, message.previous));
+    case "SET_NAME_DICTIONARY_ENABLED":
+      requireTrusted(sender);
+      return updateNameDictionary(() => nameDictionary.setEnabled(message.enabled));
     case "SAVE_SETTINGS":
       requireTrusted(sender);
       return updateSettings(() => message.settings);
@@ -170,7 +202,11 @@ async function handleMessage(message, sender) {
               "targetLanguage",
               "mode",
               "showFloatingButton",
+              "translationShortcut",
               "autoTranslateSites",
+              "visibleOnly",
+              "cacheEnabled",
+              "cacheLimitMb",
             ].includes(key),
           ),
         ),
@@ -178,6 +214,33 @@ async function handleMessage(message, sender) {
     case "OPEN_OPTIONS":
       await chrome.runtime.openOptionsPage();
       return null;
+    case "GET_CACHE_STATS": {
+      requireTrusted(sender);
+      const settings = await getSettings();
+      const stats = await cache.stats();
+      return {
+        ...stats,
+        limitBytes: settings.cacheLimitMb * 1024 * 1024,
+        overLimit: stats.bytes > settings.cacheLimitMb * 1024 * 1024,
+      };
+    }
+    case "CLEAR_CACHE": {
+      requireTrusted(sender);
+      const stats = await cache.clear();
+      const tabs = await chrome.tabs.query({});
+      await Promise.allSettled(
+        tabs
+          .filter((tab) => isTranslatableUrl(tab.url))
+          .map((tab) => chrome.tabs.sendMessage(tab.id, { type: "CACHE_CLEARED" })),
+      );
+      return stats;
+    }
+    case "EXPORT_CACHE":
+      requireTrusted(sender);
+      return cache.exportData();
+    case "IMPORT_CACHE":
+      requireTrusted(sender);
+      return cache.importData(message.data, message.revision);
     case "GET_TAB_STATE":
       requireTrusted(sender);
       try {
@@ -187,6 +250,10 @@ async function handleMessage(message, sender) {
       }
     case "PAGE_ACTION":
       return pageAction(message, sender);
+    case "PAGE_SHORTCUT":
+      if (!sender.tab || sender.frameId === 0 || !isTranslatableUrl(sender.tab.url))
+        throw new TranslationError("FORBIDDEN", "无效的网页快捷键操作。");
+      return chrome.tabs.sendMessage(sender.tab.id, { type: "TOGGLE_TRANSLATION" }, { frameId: 0 });
     case "PAGE_PREFERENCES":
       return pagePreferences(message, sender);
     case "FRAME_READY":
@@ -240,15 +307,22 @@ async function handleMessage(message, sender) {
         });
       }
       return null;
+    case "LOOKUP_CACHE":
     case "TRANSLATE_BATCH": {
       if (!sender.tab || typeof message.runId !== "string" || message.runId.length > 100)
         throw new TranslationError("FORBIDDEN", "无效的翻译请求。");
       const settings = await getSettings();
       if (message.signature !== publicSettings(settings).signature) {
-        throw new TranslationError("CONFIG_CHANGED", "服务或目标语言已更改，请重新点击翻译。", {
-          fatal: true,
-        });
+        throw new TranslationError(
+          "CONFIG_CHANGED",
+          "服务、目标语言或人名字典已更改，请重新点击翻译。",
+          {
+            fatal: true,
+          },
+        );
       }
+      if (message.type === "LOOKUP_CACHE")
+        return lookupCachedTranslations({ cache, settings, segments: message.segments });
       const requestId = `${sender.tab.id}:${sender.frameId}:${crypto.randomUUID()}`;
       const controller = new AbortController();
       inflight.set(requestId, {
@@ -258,9 +332,9 @@ async function handleMessage(message, sender) {
         controller,
       });
       try {
-        return await translateBatch({
-          provider: settings.providers[settings.provider],
-          targetLanguage: settings.targetLanguage,
+        return await translateWithCache({
+          cache,
+          settings,
           segments: message.segments,
           signal: controller.signal,
         });

@@ -1,3 +1,5 @@
+import { normalizeShortcut } from "./shortcut.js";
+
 /** @typedef {'deepseek'|'openai'} ProviderId 支持的 API 服务。 */
 /**
  * @typedef {Object} ProviderSettings 一个服务的本机配置。
@@ -12,6 +14,10 @@
  * @property {string} targetLanguage 目标语言代码。
  * @property {'bilingual'|'replace'} mode 默认排版。
  * @property {boolean} showFloatingButton 是否显示网页入口。
+ * @property {string} translationShortcut 切换翻译与恢复原文的快捷键；空字符串表示停用。
+ * @property {boolean} visibleOnly 是否只翻译当前视口可见的段落。
+ * @property {boolean} cacheEnabled 是否跨页面、刷新和重启保存译文缓存。
+ * @property {number} cacheLimitMb 缓存容量提醒阈值（MiB），超出后继续保存。
  * @property {string[]} autoTranslateSites 精确匹配的主机名，不隐式包含子域。
  */
 
@@ -41,6 +47,10 @@ export const DEFAULT_SETTINGS = {
   targetLanguage: "zh-CN",
   mode: "bilingual",
   showFloatingButton: true,
+  translationShortcut: "Ctrl+X",
+  visibleOnly: false,
+  cacheEnabled: false,
+  cacheLimitMb: 512,
   autoTranslateSites: [],
 };
 
@@ -101,6 +111,9 @@ export function normalizeSites(value) {
 
 /** 合并并校验本机设置；只保留已知字段。@param {Partial<Settings>} input 已存储或表单配置。@returns {Settings} 完整配置。 */
 export function normalizeSettings(input = {}) {
+  const cacheLimitMb = Number(input.cacheLimitMb ?? DEFAULT_SETTINGS.cacheLimitMb);
+  if (!Number.isFinite(cacheLimitMb) || cacheLimitMb < 1 || cacheLimitMb > 10240)
+    throw new Error("缓存容量提醒阈值需要在 1～10240 MB 之间。");
   const providers = {};
   for (const id of ["deepseek", "openai"]) {
     const candidate = input.providers?.[id] || {};
@@ -122,6 +135,12 @@ export function normalizeSettings(input = {}) {
       : "zh-CN",
     mode: input.mode === "replace" ? "replace" : "bilingual",
     showFloatingButton: input.showFloatingButton !== false,
+    translationShortcut: normalizeShortcut(
+      input.translationShortcut ?? DEFAULT_SETTINGS.translationShortcut,
+    ),
+    visibleOnly: input.visibleOnly === true,
+    cacheEnabled: input.cacheEnabled === true,
+    cacheLimitMb,
     autoTranslateSites: normalizeSites(input.autoTranslateSites || []),
   };
 }
@@ -129,20 +148,22 @@ export function normalizeSettings(input = {}) {
 /** 生成可发送到 content script 的配置，绝不包含 Key。@param {Settings} settings 本机配置。@returns {Object} 脱敏配置。 */
 export function publicSettings(settings) {
   const current = settings.providers[settings.provider];
+  const signature = [settings.provider, current.baseUrl, current.model, settings.targetLanguage];
+  // 无有效字典时保持旧缓存键兼容；摘要不向网页暴露人名及描述。
+  if (settings.nameDictionarySignature) signature.push(settings.nameDictionarySignature);
   return {
     provider: settings.provider,
     model: current.model,
     targetLanguage: settings.targetLanguage,
     mode: settings.mode,
     showFloatingButton: settings.showFloatingButton,
+    translationShortcut: settings.translationShortcut,
+    visibleOnly: settings.visibleOnly,
+    cacheEnabled: settings.cacheEnabled,
+    nameDictionarySignature: settings.nameDictionarySignature || "",
     autoTranslateSites: settings.autoTranslateSites,
     configured: Boolean(current.apiKey),
-    signature: JSON.stringify([
-      settings.provider,
-      current.baseUrl,
-      current.model,
-      settings.targetLanguage,
-    ]),
+    signature: JSON.stringify(signature),
     configuredProviders: Object.fromEntries(
       Object.entries(settings.providers).map(([id, config]) => [id, Boolean(config.apiKey)]),
     ),

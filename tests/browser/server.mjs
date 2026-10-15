@@ -102,7 +102,8 @@ export async function startServer() {
     }
     if (!request.url.endsWith("/chat/completions")) {
       response.setHeader("Content-Type", "text/html; charset=utf-8");
-      if (request.url === "/readme") response.end(readme);
+      if (request.url === "/viewport-frames") response.end(state.frameDocument || "");
+      else if (request.url === "/readme") response.end(readme);
       else if (request.url === "/frame")
         response.end(
           '<!doctype html><html lang="en"><body><p id="frameText">Frame paragraph.</p></body></html>',

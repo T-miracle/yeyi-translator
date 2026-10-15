@@ -54,6 +54,7 @@ for (const size of [16, 32, 48, 128])
 await writeFile(resolve(out, "icons/source.svg"), icon);
 try {
   await copyFile(resolve(root, "README.md"), resolve(out, "README.md"));
+  await copyFile(resolve(root, "CHANGELOG.md"), resolve(out, "CHANGELOG.md"));
 } catch {
   /* 开发中的首次构建可能尚未生成说明。 */
 }

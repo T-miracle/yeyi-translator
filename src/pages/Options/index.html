@@ -22,11 +22,13 @@
           <a href="#api" class="active"><span>◈</span>翻译服务</a
           ><a href="#preferences"><span>☷</span>阅读偏好</a
           ><a href="#sites"><span>◎</span>自动翻译</a>
+          <a href="#cache"><span>▤</span>翻译缓存</a>
+          <a href="#names"><span>字</span>人名字典</a>
         </nav>
         <div class="sidebar-note">
           <span class="mini-mark">译</span>
           <p>语言之间，<br />少一点距离。</p>
-          <small>Chrome & Edge<br />Manifest V3 · v1.0.1</small>
+          <small>Chrome & Edge<br />Manifest V3 · v1.3.0</small>
         </div>
       </aside>
       <main>
@@ -222,14 +224,53 @@
             </div>
             <div class="preference-toggle">
               <div>
-                <strong>网页悬浮按钮</strong>
-                <p class="hint">在网页右下角快速翻译、暂停与恢复原文</p>
+                <strong>只翻译可视页面</strong>
+                <p class="hint">
+                  默认关闭。优先翻译可视内容，并向上、向下各预翻译 10 句；滚动后自动更新
+                </p>
               </div>
               <label class="switch"
                 ><input
-                  name="showFloatingButton"
+                  name="visibleOnly"
                   type="checkbox"
-                  aria-label="显示网页悬浮按钮" /><span></span
+                  aria-label="只翻译可视页面" /><span></span
+              ></label>
+            </div>
+            <div class="preference-toggle shortcut-preference">
+              <div>
+                <label for="translationShortcut"><strong>快捷翻译</strong></label>
+                <p class="hint" id="shortcutHint">
+                  默认 Ctrl+X，切换翻译与恢复原文。点击右侧输入框后按下新组合；支持 Ctrl / Alt /
+                  Meta 搭配字母、数字或 F1～F12，可附加 Shift。输入框内保留剪切等操作
+                </p>
+              </div>
+              <div class="shortcut-controls">
+                <input
+                  id="translationShortcut"
+                  name="translationShortcut"
+                  type="text"
+                  readonly
+                  aria-describedby="shortcutHint"
+                  placeholder="已停用"
+                />
+                <div class="shortcut-actions">
+                  <button type="button" class="button subtle" data-shortcut="reset">
+                    恢复默认
+                  </button>
+                  <button type="button" class="button subtle" data-shortcut="clear">停用</button>
+                </div>
+              </div>
+            </div>
+            <div class="preference-toggle">
+              <div>
+                <strong>隐藏悬浮球</strong>
+                <p class="hint">默认不隐藏。开启隐藏后，启动翻译时显示，恢复原文后自动隐藏</p>
+              </div>
+              <label class="switch"
+                ><input
+                  name="hideFloatingButton"
+                  type="checkbox"
+                  aria-label="隐藏悬浮球" /><span></span
               ></label>
             </div>
           </section>
@@ -256,12 +297,166 @@
               </p>
             </div>
           </section>
+          <section id="cache">
+            <div class="section-heading">
+              <div>
+                <span class="section-number">04</span>
+                <h2>翻译缓存</h2>
+              </div>
+              <span>本机保存 · 可导入导出</span>
+            </div>
+            <div class="cache-card">
+              <div class="cache-toggle">
+                <div>
+                  <strong>启用持久翻译缓存</strong>
+                  <p class="hint">
+                    默认关闭。命中缓存立即显示，仅未命中内容排队；刷新页面或重启浏览器后仍有效
+                  </p>
+                </div>
+                <label class="switch"
+                  ><input
+                    name="cacheEnabled"
+                    type="checkbox"
+                    aria-label="启用持久翻译缓存" /><span></span
+                ></label>
+              </div>
+              <div class="cache-details">
+                <div>
+                  <span class="field-title">当前缓存</span>
+                  <p class="cache-usage">
+                    <span id="cacheUsage">正在读取…</span
+                    ><span
+                      id="cacheWarning"
+                      class="cache-warning"
+                      role="img"
+                      aria-label="缓存警告"
+                      hidden
+                      >!</span
+                    >
+                  </p>
+                </div>
+                <label class="field"
+                  ><span class="field-title">容量提醒阈值（MB）</span
+                  ><input
+                    name="cacheLimitMb"
+                    type="number"
+                    min="1"
+                    max="10240"
+                    step="1"
+                    aria-label="容量提醒阈值（MB）"
+                /></label>
+              </div>
+              <p class="hint">
+                超过阈值仍继续保存，并显示感叹号，不自动删除。关闭缓存保留已有数据，重新开启后可继续复用。
+              </p>
+              <p class="hint cache-notice" id="cacheNotice" role="status" hidden></p>
+              <div class="cache-actions">
+                <button type="button" class="button" id="exportCache" data-cache-action>
+                  导出缓存
+                </button>
+                <button type="button" class="button" id="importCache" data-cache-action>
+                  导入缓存
+                </button>
+                <button type="button" class="button" id="clearCache" data-cache-action>
+                  清空缓存
+                </button>
+                <input id="cacheFile" type="file" accept=".json,application/json" hidden />
+              </div>
+              <p class="hint" id="cacheResult" role="status"></p>
+              <p class="hint">
+                缓存按接口、模型、目标语言和原文区分。导入仅合并新条目，保留本机已有译文。导出不含
+                Key 和设置，但包含译文，请谨慎分享。
+              </p>
+            </div>
+          </section>
+          <section id="names">
+            <div class="section-heading">
+              <div>
+                <span class="section-number">05</span>
+                <h2>人名字典</h2>
+              </div>
+              <span>即时保存 · 兼容 AiNiee</span>
+            </div>
+            <div class="cache-card name-card">
+              <div class="cache-toggle">
+                <div>
+                  <strong>启用人名字典</strong>
+                  <p class="hint">
+                    独立人名直接使用约定译文，正文中的人名交给 AI
+                    按字典翻译。修改后自动更新翻译中的页面。
+                  </p>
+                </div>
+                <label class="switch"
+                  ><input
+                    id="nameDictionaryEnabled"
+                    type="checkbox"
+                    aria-label="启用人名字典" /><span></span
+                ></label>
+              </div>
+              <div class="cache-actions">
+                <button type="button" class="button" id="importNames">导入字典</button>
+                <button type="button" class="button" id="exportNames">导出字典</button>
+                <button type="button" class="button" id="reloadNames">重新载入</button>
+                <input id="nameFile" type="file" accept=".json,application/json" hidden />
+              </div>
+              <p class="hint">
+                支持 AiNiee 的 src / dst / info JSON
+                列表。导入只合并新条目，重复原文保留本机数据；不区分大小写，按普通文字匹配。空译文不参与翻译。
+              </p>
+              <div class="name-editor">
+                <label class="field"
+                  ><span class="field-title">原文人名</span
+                  ><input id="nameSource" maxlength="500" placeholder="填写原文人名"
+                /></label>
+                <label class="field"
+                  ><span class="field-title">约定译名</span
+                  ><input id="nameTranslation" maxlength="500" placeholder="填写译名，可留空待补充"
+                /></label>
+                <label class="field name-info"
+                  ><span class="field-title">描述（可选）</span
+                  ><textarea
+                    id="nameInfo"
+                    rows="2"
+                    maxlength="2000"
+                    placeholder="角色身份、称呼或来源备注"
+                  ></textarea>
+                </label>
+              </div>
+              <div class="cache-actions">
+                <button type="button" class="button primary" id="saveName">添加人名</button>
+                <button type="button" class="button" id="cancelName">取消编辑</button>
+              </div>
+              <p class="hint" id="nameResult" role="status"></p>
+              <label class="field"
+                ><span class="field-title">搜索人名、译文或描述</span
+                ><input id="nameSearch" type="search" placeholder="输入关键词筛选"
+              /></label>
+              <p class="hint" id="nameCount" role="status">正在读取…</p>
+              <div class="name-table-wrap">
+                <table class="name-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">原文</th>
+                      <th scope="col">译文</th>
+                      <th scope="col">描述</th>
+                      <th scope="col">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="nameRows"></tbody>
+                </table>
+              </div>
+              <p class="hint" id="nameEmpty" hidden>暂无匹配人名，可添加或导入 JSON 字典。</p>
+              <p class="hint">
+                字典仅保存在本机，操作即时生效；约定译名适用于所有目标语言。翻译时只向当前接口发送命中的条目，导出文件仅包含人名、译文和描述。
+              </p>
+            </div>
+          </section>
           <div class="privacy-note">
             <span>◇</span>
             <p>
               <strong>由你掌握的数据</strong><br />Key
               和偏好仅保存在本机。网页文字直接发送到你配置的
-              API；页译没有中转服务器。原文与译文只在当前页面内存中保存，刷新后清空。
+              API；页译没有中转服务器。默认只在页面内存保存译文；开启缓存后，译文与原文摘要会持久保存在本机，可导出或清理。
             </p>
           </div>
           <div class="save-bar">

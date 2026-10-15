@@ -1,17 +1,20 @@
 {
   "name": "yeyi-translator",
-  "version": "1.0.5",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "description": "页译：支持 Chrome / Edge、DeepSeek / OpenAI 的整页翻译扩展",
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "node scripts/check.mjs",
-    "format": "prettier --write src scripts tests manifest.json package.json README.md",
-    "format:check": "prettier --check src scripts tests manifest.json package.json README.md",
-    "test": "npm run test:regression && node tests/browser/run.mjs",
-    "test:regression": "node --test tests/regression/api-connection.test.mjs tests/regression/inline-code.test.mjs tests/regression/translation-order.test.mjs tests/regression/chinese-skip.test.mjs",
+    "format": "prettier --write src scripts tests manifest.json package.json README.md CHANGELOG.md",
+    "format:check": "prettier --check src scripts tests manifest.json package.json README.md CHANGELOG.md",
+    "test": "npm run test:regression && node tests/browser/run.mjs && node --test tests/browser/features.test.mjs && npm run test:shortcuts && npm run test:names",
+    "test:regression": "node --test tests/regression/api-connection.test.mjs tests/regression/inline-code.test.mjs tests/regression/translation-order.test.mjs tests/regression/batching.test.mjs tests/regression/chinese-skip.test.mjs tests/regression/cache.test.mjs tests/regression/cache-priority.test.mjs tests/regression/visibility.test.mjs",
     "test:browser": "node tests/browser/run.mjs",
+    "test:features": "node --test tests/browser/features.test.mjs",
+    "test:shortcuts": "node --test tests/regression/shortcut.test.mjs tests/browser/shortcut.test.mjs",
+    "test:names": "node --test tests/regression/name-dictionary.test.mjs tests/browser/name-dictionary.test.mjs",
     "package": "npm run build && node scripts/package.mjs"
   },
   "devDependencies": {

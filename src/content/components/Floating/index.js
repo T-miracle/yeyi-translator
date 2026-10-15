@@ -8,6 +8,8 @@ export class FloatingControl {
     this.onAction = onAction;
     /** @type {boolean} 是否正在等待用户命令确认，避免重复点击。 */
     this.busy = false;
+    /** @type {boolean} 未翻译时是否也显示入口；沿用已有配置字段，兼容旧设置。 */
+    this.showFloatingButton = true;
     /** @type {Object} 最近一次全页进度，不包含原文或密钥。 */
     this.state = { active: false, total: 0, done: 0, failed: 0, phase: "idle", mode: "bilingual" };
     /** @type {HTMLDivElement} 文本收集器排除的控件宿主。 */
@@ -77,6 +79,7 @@ export class FloatingControl {
       await this.onAction(action, mode);
     } catch (error) {
       this.panel.showError(error.message);
+      this.setVisible(true);
       this.toggle(true);
     } finally {
       this.busy = false;
@@ -118,16 +121,25 @@ export class FloatingControl {
     this.root.querySelector(".arc").style.strokeDashoffset = String(100 - percent);
     this.root.querySelector(".notice").hidden = !state.failed && !state.error;
     this.panel.updateState(state);
+    this.setVisible(this.showFloatingButton || translated);
   }
 
   /** 应用后台公开的阅读偏好，绝不接触密钥。@param {Object} config 公开配置。@returns {void} 无返回值。 */
   setConfig(config) {
+    this.showFloatingButton = config.showFloatingButton !== false;
+    this.root
+      .querySelector(".translate-toggle")
+      .setAttribute(
+        "aria-keyshortcuts",
+        (config.translationShortcut || "").replace("Ctrl", "Control"),
+      );
     this.panel.updateConfig(config);
-    this.setVisible(config.showFloatingButton);
+    this.setVisible(this.showFloatingButton || Boolean(this.state.active || this.state.total));
   }
 
   /** 应用悬浮按钮可见性。@param {boolean} visible 是否显示。@returns {void} 无返回值。 */
   setVisible(visible) {
+    if (!visible) this.toggle(false);
     this.host.style.setProperty("display", visible ? "block" : "none", "important");
   }
 }

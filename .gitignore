@@ -4,3 +4,5 @@ release/
 test-results/
 *.log
 .env*
+# 人名字典及其来源属于本机用户数据，不提交或打包。
+user-data/

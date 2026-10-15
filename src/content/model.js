@@ -3,6 +3,9 @@ const SKIP =
 const PROSE = "article,main,[role=main],[role=article],.markdown-body";
 const PROSE_BLOCK = "p,li,td,th,dt,dd,figcaption,caption,summary,h1,h2,h3,h4,h5,h6";
 const CODE_SYNTAX = "pre,.hljs,.highlight,[class*=language-],[class*=highlight-source-]";
+// Discord 的哈希后缀随版本变化；使用语义 ID 和类名前缀排除作者、回复作者及成员名。
+const DISCORD_NAMES =
+  '[id^="message-username-"],[class*="username_"],[class*="displayName_"],[class*="nickname_"],[data-user-id]';
 const BLOCK_DISPLAYS = new Set([
   "block",
   "flow-root",
@@ -72,6 +75,9 @@ export function collectGroups(doc, ownership) {
   const visibility = new Map();
   const codeLabels = new Map();
   const codeEligibility = new Map();
+  const discord =
+    /(^|\.)(discord\.com|discordapp\.com)$/i.test(doc.location?.hostname || "") ||
+    Boolean(doc.querySelector('#app-mount [id^="chat-messages-"],[data-list-id="chat-messages"]'));
   /** 以原文判断节点类型，避免替换模式写入译文后改变扫描结果。@param {Text} text 文本节点。@returns {string} 当前仍受扩展管理的原文或网站新文本。 */
   function originalOf(text) {
     const previous = ownership.get(text);
@@ -141,12 +147,16 @@ export function collectGroups(doc, ownership) {
     const style = styleOf(element);
     const ownVisible =
       !element.matches(SKIP) &&
+      !(discord && element.matches(DISCORD_NAMES)) &&
       (element.tagName !== "CODE" || translatableCode(element)) &&
       !element.hidden &&
       element.getAttribute("aria-hidden") !== "true" &&
       style.display !== "none" &&
       style.visibility !== "hidden" &&
       style.visibility !== "collapse" &&
+      Number(style.opacity) !== 0 &&
+      !/^rect\(0px[, ]+0px[, ]+0px[, ]+0px\)$/.test(style.clip) &&
+      style.clipPath !== "inset(50%)" &&
       style.contentVisibility !== "hidden";
     const result =
       ownVisible &&
@@ -217,8 +227,8 @@ export function textFragments(text, preserveAll = false) {
     }));
 }
 
-/** 为需要翻译的外文构造有界 API 任务，中文仅作为可选上下文并保留节点位置。@param {Object} unit 段落。@returns {Object[]} 每项含 id、parts、context 和节点内片段索引。 */
-export function createChunks(unit) {
+/** 为外文及本机字典检查构造有界任务；字典启用时中文先交后台本机替换，绝不作为正文请求 API。@param {Object} unit 段落。@param {boolean} [checkNames] 是否存在有效人名字典。@returns {Object[]} 含节点位置与 dictionaryOnly 标记的片段。 */
+export function createChunks(unit, checkNames = false) {
   const chinese = isChineseText(unit.nodes.map((record) => record.original).join(""));
   for (const record of unit.nodes) record.fragments = textFragments(record.original, chinese);
   const context =
@@ -234,6 +244,7 @@ export function createChunks(unit) {
   let parts = [];
   let locations = [];
   let length = 0;
+  let dictionaryOnly = false;
   /** 结束当前 API 片段。@returns {void} 无返回值。 */
   function flush() {
     if (!parts.length) return;
@@ -241,6 +252,7 @@ export function createChunks(unit) {
       id: `${unit.id}:${chunks.length}`,
       parts,
       locations,
+      ...(dictionaryOnly ? { dictionaryOnly: true } : {}),
       ...(context ? { context } : {}),
       state: "pending",
       translated: null,
@@ -251,7 +263,12 @@ export function createChunks(unit) {
   }
   unit.nodes.forEach((record, nodeIndex) => {
     record.fragments.forEach((fragment, fragmentIndex) => {
-      if (fragment.preserve) return;
+      const local = fragment.preserve && checkNames && /\p{L}/u.test(fragment.text);
+      if (fragment.preserve && !local) return;
+      // 字典检查与远程翻译分开合片，保留中文字句不受模型改写。
+      if (local !== dictionaryOnly) flush();
+      dictionaryOnly = local;
+      fragment.preserve = false;
       splitText(fragment.text).forEach((part) => {
         if (parts.length >= 40 || length + part.length > 2800) flush();
         parts.push(part);

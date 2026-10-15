@@ -1,5 +1,25 @@
 import { collectGroups, compareDocumentOrder, createChunks } from "./model.js";
 import { sendMessage } from "../shared/messaging.js";
+import { visibleTranslationScope } from "./visibility.js";
+
+const BATCH_MAX_SEGMENTS = 18;
+const BATCH_MAX_CHARS = 4800;
+const BATCH_WAIT_MS = 200;
+
+/** 使用同一字符计量约束缓存预检与 API 批次，保留中文上下文的预算。 */
+function chunkSize(chunk) {
+  return chunk.parts.reduce((sum, part) => sum + part.length, 0) + (chunk.context?.length || 0);
+}
+
+/** 只发送原文片段与上下文，不将节点、排版记录或缓存结构传到后台。 */
+function segmentsOf(tasks) {
+  return tasks.map(({ chunk }) => ({
+    id: chunk.id,
+    parts: chunk.parts,
+    ...(chunk.dictionaryOnly ? { dictionaryOnly: true } : {}),
+    ...(chunk.context ? { context: chunk.context } : {}),
+  }));
+}
 
 /**
  * 单个 frame 的整页翻译会话。原文、译文与缓存均只存在此页面的内存中。
@@ -14,12 +34,16 @@ export class TranslationEngine {
     this.onChange = onChange;
     /** @type {Map<Element,Object>} 仍可能需要恢复的段落。 */
     this.units = new Map();
+    /** @type {Map<Element,number>|null} 视口及上下预翻译窗口；0 为当前可视内容。 */
+    this.scope = null;
     /** @type {WeakMap<Text,Object>} 节点原文与最后一次自有写入。 */
     this.ownership = new WeakMap();
     /** @type {Map<string,Object>} 当前页面的有限译文缓存。 */
     this.cache = new Map();
     /** @type {number} 缓存键及值占用的 UTF-16 字符数。 */
     this.cacheChars = 0;
+    /** @type {number} 清理缓存后阻止旧请求重新写回页面缓存。 */
+    this.cacheRevision = 0;
     /** @type {Object|null} 当前运行的脱敏配置快照。 */
     this.config = null;
     /** @type {'idle'|'translating'|'watching'|'paused'|'error'} 可显示的会话阶段。 */
@@ -32,10 +56,16 @@ export class TranslationEngine {
     this.sequence = 0;
     /** @type {number} 当前运行尚未结束的批次数，上限为一，补译共用同一名额。 */
     this.workers = 0;
+    /** @type {Object|null} 发送前检查的独立令牌，避免重入及旧会话回调干扰新会话。 */
+    this.dispatchToken = null;
+    /** @type {Set<Promise<void>>} 当前会话尚未完成的缓存预检。 */
+    this.cacheLookups = new Set();
     /** @type {string} 可安全展示的最近错误。 */
     this.error = "";
     /** @type {ReturnType<typeof setTimeout>|null} 合并动态内容扫描的计时器。 */
     this.scanTimer = null;
+    /** @type {ReturnType<typeof setTimeout>|null} 未满批次的固定聚合窗口，不随新增内容重置。 */
+    this.batchTimer = null;
     /** @type {ReturnType<typeof setInterval>|null} 请求期间的 worker 保活计时器。 */
     this.keepAlive = null;
     /** @type {MutationObserver} 只在会话开启时订阅页面内容。 */
@@ -43,6 +73,22 @@ export class TranslationEngine {
       if (this.active && records.some((record) => !this.isOwnedMutation(record)))
         this.scheduleScan();
     });
+    /** @type {Function} 捕获内部滚动容器的事件，视口模式更快扫描新露出的文字。 */
+    this.onViewportChange = () => this.scheduleScan(this.config?.visibleOnly ? 60 : 400);
+    /** @type {boolean} 子帧必须先确认外层页面中实际有交集。 */
+    this.frameVisible = window === window.top;
+    /** @type {IntersectionObserver|null} 浏览器负责跨域 iframe 的外层裁剪和滚动通知。 */
+    this.frameObserver =
+      window === window.top
+        ? null
+        : new IntersectionObserver((entries) => {
+            const entry = entries[0];
+            this.frameVisible =
+              entry.isIntersecting &&
+              entry.intersectionRect.width > 0 &&
+              entry.intersectionRect.height > 0;
+            if (this.active && this.config.visibleOnly) this.scheduleScan(0);
+          });
   }
 
   /** 返回可展示的进度，永远不包括原文和密钥。@returns {Object} 本 frame 状态。 */
@@ -115,7 +161,7 @@ export class TranslationEngine {
   }
 
   /** 把频繁的 DOM 更新合并到一次扫描。@returns {void} 无返回值。 */
-  scheduleScan() {
+  scheduleScan(delay = 400) {
     if (this.scanTimer || !this.active) return;
     this.scanTimer = setTimeout(() => {
       this.scanTimer = null;
@@ -123,7 +169,93 @@ export class TranslationEngine {
         this.scan();
         this.pump();
       }
-    }, 400);
+    }, delay);
+  }
+
+  /** 清空页面复用缓存，保留当前显示的译文和原文恢复记录。 */
+  clearCache() {
+    this.cacheRevision++;
+    this.dispatchToken = null;
+    this.cacheLookups = new Set();
+    this.cache.clear();
+    this.cacheChars = 0;
+    for (const unit of this.units.values())
+      for (const chunk of unit.chunks)
+        if (["unchecked", "checking"].includes(chunk.state)) chunk.state = "pending";
+    this.pump();
+  }
+
+  /** 视口内容优先，其余按距离排序；整页模式继续使用文档顺序。 */
+  compareUnits(first, second) {
+    return (
+      (this.scope?.get(first.element) || 0) - (this.scope?.get(second.element) || 0) ||
+      compareDocumentOrder(first.element, second.element)
+    );
+  }
+
+  /**
+   * 独立于网络批次读取缓存：命中立即完成并渲染，缺项才变为 pending。
+   * 未检查项保持 checking，不占用翻译批次；分页读取仍可在旧网络请求期间处理新增缓存命中。
+   * 停止、切换配置、清理或网站替换节点后，迟到查询不能覆盖新会话与页面内容。
+   */
+  async lookupCache(tasks, runId, revision) {
+    const current = () => this.active && this.runId === runId && this.cacheRevision === revision;
+    try {
+      let index = 0;
+      while (index < tasks.length && current()) {
+        const batch = [];
+        let length = 0;
+        while (index < tasks.length && batch.length < BATCH_MAX_SEGMENTS) {
+          const task = tasks[index];
+          const size = chunkSize(task.chunk);
+          if (batch.length && length + size > BATCH_MAX_CHARS) break;
+          batch.push(task);
+          length += size;
+          index++;
+        }
+        const cached = await sendMessage({
+          type: "LOOKUP_CACHE",
+          runId,
+          signature: this.config.signature,
+          segments: segmentsOf(batch),
+        });
+        if (!current()) return;
+        const hits = new Map(cached.map((item) => [item.id, item.parts]));
+        this.mutate(() => {
+          for (const { unit, chunk } of batch) {
+            if (this.units.get(unit.element) !== unit || chunk.state !== "checking") continue;
+            const parts = hits.get(chunk.id);
+            if (!parts) {
+              chunk.state = "pending";
+              continue;
+            }
+            chunk.translated = parts;
+            chunk.state = "done";
+            if (unit.chunks.every((item) => item.state === "done")) {
+              this.remember(unit);
+              this.renderUnit(unit);
+            }
+          }
+        });
+        this.publish();
+      }
+      if (this.config.visibleOnly) this.scheduleScan(60);
+    } catch (error) {
+      if (!current()) return;
+      if (error.fatal) {
+        this.error = error.message;
+        this.stop(false);
+        this.phase = "error";
+        this.publish();
+        return;
+      }
+      // 查询异常只回退到正常翻译，不覆盖或删除持久缓存。
+      for (const { unit, chunk } of tasks)
+        if (this.units.get(unit.element) === unit && chunk.state === "checking")
+          chunk.state = "pending";
+    } finally {
+      if (current()) this.pump();
+    }
   }
 
   /** 撤回段落的自有写入；网站后来修改的文字绝不会被旧原文覆盖。@param {Object} unit 段落。@returns {void} 无返回值。 */
@@ -205,9 +337,11 @@ export class TranslationEngine {
     }
   }
 
-  /** 重新协调可见 DOM 和记录；失效段落的迟到结果会被忽略。@returns {void} 无返回值。 */
+  /** 重新协调可见 DOM 和记录；失效段落的迟到结果会被忽略。@returns {Promise<void>|undefined} 本次缓存预检完成，可在合批发送前等待新增缺项入队。 */
   scan() {
+    if (this.config.visibleOnly && !this.frameVisible) return;
     const groups = collectGroups(document, this.ownership);
+    this.scope = this.config.visibleOnly ? visibleTranslationScope(groups) : null;
     this.mutate(() => {
       for (const [element, unit] of this.units) {
         const nodes = groups.get(element);
@@ -243,7 +377,8 @@ export class TranslationEngine {
           nodes: records.map((record) => ({ ...record, lastWritten: record.original })),
           chunks: [],
         };
-        unit.chunks = createChunks(unit);
+        if (this.scope && !this.scope.has(element)) continue;
+        unit.chunks = createChunks(unit, Boolean(this.config.nameDictionarySignature));
         unit.nodes.forEach((record) => this.ownership.set(record.node, record));
         const cached = this.cache.get(this.cacheKey(unit));
         if (cached && cached.value.length === unit.chunks.length) {
@@ -252,12 +387,34 @@ export class TranslationEngine {
             chunk.state = "done";
           });
           this.renderUnit(unit);
+        } else if (this.config.cacheEnabled) {
+          for (const chunk of unit.chunks) chunk.state = "unchecked";
         }
         if (!unit.chunks.length) this.renderUnit(unit);
         this.units.set(element, unit);
       }
     });
+    const lookups = [...this.units.values()]
+      .filter((unit) => !this.scope || this.scope.has(unit.element))
+      .sort((first, second) => this.compareUnits(first, second))
+      .flatMap((unit) =>
+        unit.chunks
+          .filter((chunk) => chunk.state === "unchecked")
+          .map((chunk) => {
+            chunk.state = "checking";
+            return { unit, chunk };
+          }),
+      );
+    const lookup = lookups.length
+      ? this.lookupCache(lookups, this.runId, this.cacheRevision)
+      : undefined;
+    if (lookup) {
+      const pending = this.cacheLookups;
+      pending.add(lookup);
+      void lookup.finally(() => pending.delete(lookup));
+    }
     this.publish();
+    return lookup;
   }
 
   /** 开始或继续整页翻译。@param {Object} config 后台提供的脱敏配置。@param {boolean} [retry] 是否重新排队失败片段。@returns {void} 无返回值。 */
@@ -273,19 +430,30 @@ export class TranslationEngine {
     }
     this.config = { ...config };
     this.runId = crypto.randomUUID();
+    this.dispatchToken = null;
+    this.cacheLookups = new Set();
     this.active = true;
+    if (config.visibleOnly && this.frameObserver) {
+      this.frameVisible = false;
+      this.frameObserver.observe(document.documentElement);
+    }
     this.phase = "translating";
     this.error = "";
     this.workers = 0;
     for (const unit of this.units.values()) {
       for (const chunk of unit.chunks)
-        if (chunk.state === "inflight" || (retry && chunk.state === "failed"))
-          chunk.state = "pending";
+        if (
+          ["inflight", "unchecked", "checking", "pending"].includes(chunk.state) ||
+          (retry && chunk.state === "failed")
+        )
+          chunk.state = config.cacheEnabled ? "unchecked" : "pending";
     }
     this.mutate(() => {
       for (const unit of this.units.values()) this.renderUnit(unit);
     });
     this.observe();
+    document.addEventListener("scroll", this.onViewportChange, { capture: true, passive: true });
+    window.addEventListener("resize", this.onViewportChange, { passive: true });
     // Chrome MV3 的空闲计时由扩展消息重置；只在有网络请求时维持会话。
     this.keepAlive = setInterval(() => {
       if (this.workers) sendMessage({ type: "PING" }).catch(() => {});
@@ -299,13 +467,21 @@ export class TranslationEngine {
     const oldRun = this.runId;
     this.active = false;
     this.runId = crypto.randomUUID();
+    this.dispatchToken = null;
+    this.cacheLookups = new Set();
     this.observer.disconnect();
+    this.frameObserver?.disconnect();
+    document.removeEventListener("scroll", this.onViewportChange, true);
+    window.removeEventListener("resize", this.onViewportChange);
     clearTimeout(this.scanTimer);
     this.scanTimer = null;
+    clearTimeout(this.batchTimer);
+    this.batchTimer = null;
     clearInterval(this.keepAlive);
     this.keepAlive = null;
     for (const unit of this.units.values())
-      for (const chunk of unit.chunks) if (chunk.state === "inflight") chunk.state = "pending";
+      for (const chunk of unit.chunks)
+        if (["inflight", "unchecked", "checking"].includes(chunk.state)) chunk.state = "pending";
     sendMessage({ type: "CANCEL_RUN", runId: oldRun }).catch(() => {});
     if (notify) {
       this.phase = "paused";
@@ -320,6 +496,7 @@ export class TranslationEngine {
       for (const unit of this.units.values()) this.restoreUnit(unit);
     });
     this.units.clear();
+    this.scope = null;
     this.ownership = new WeakMap();
     this.phase = "idle";
     this.error = "";
@@ -333,61 +510,135 @@ export class TranslationEngine {
     this.mutate(() => {
       for (const unit of this.units.values()) this.renderUnit(unit);
     });
+    if (this.config.visibleOnly) this.scheduleScan(60);
     this.publish();
   }
 
-  /** 按文档阅读顺序选择有界批次，新插入的段落也按当前位置排序。@returns {Object[]} 段落与片段任务。 */
+  /**
+   * 每批发送前协调页面、最新视口和全部缓存预检；等待期间的 DOM 变化也必须重新扫描。
+   * @param {boolean} flush 是否允许发送未满批次。
+   * @returns {Promise<void>} 检查和派发完成，不等待翻译响应。
+   */
+  async dispatchBatch(flush) {
+    const token = {};
+    const runId = this.runId;
+    this.dispatchToken = token;
+    try {
+      while (this.active && this.runId === runId && this.dispatchToken === token) {
+        clearTimeout(this.scanTimer);
+        this.scanTimer = null;
+        this.scan();
+        if (this.cacheLookups.size) {
+          await Promise.all([...this.cacheLookups]);
+          continue;
+        }
+        const { tasks, full } = this.nextBatch();
+        if (!tasks.length || (!full && !flush)) return;
+        for (const { chunk } of tasks) chunk.state = "inflight";
+        this.workers++;
+        this.phase = "translating";
+        void this.runBatch(tasks, runId);
+        return;
+      }
+    } finally {
+      if (this.dispatchToken === token) {
+        this.dispatchToken = null;
+        this.pump();
+      }
+    }
+  }
+
+  /**
+   * 按阅读顺序或视口优先级预选未缓存片段，不提前占用任务。
+   * 达到片段或字符预算即视为满批；不足时继续等待其他扫描结果，发送时才标记 inflight。
+   * @returns {{tasks:Object[],full:boolean}} 当前批次与是否应立即发送。
+   */
   nextBatch() {
+    if (this.config.visibleOnly && !this.frameVisible) return { tasks: [], full: false };
     const candidates = [...this.units.values()]
       .filter(
         (unit) =>
           unit.element.isConnected && unit.chunks.some((chunk) => chunk.state === "pending"),
       )
-      .sort((a, b) => compareDocumentOrder(a.element, b.element));
+      .filter((unit) => !this.scope || this.scope.has(unit.element))
+      .sort((first, second) => this.compareUnits(first, second));
     const tasks = [];
     let length = 0;
     for (const unit of candidates) {
       for (const chunk of unit.chunks) {
         if (chunk.state !== "pending") continue;
-        const size =
-          chunk.parts.reduce((sum, part) => sum + part.length, 0) + (chunk.context?.length || 0);
-        if (tasks.length && (length + size > 4800 || tasks.length >= 18)) return tasks;
-        chunk.state = "inflight";
+        const size = chunkSize(chunk);
+        if (tasks.length && length + size > BATCH_MAX_CHARS) return { tasks, full: true };
         tasks.push({ unit, chunk });
         length += size;
+        if (tasks.length >= BATCH_MAX_SEGMENTS || length >= BATCH_MAX_CHARS)
+          return { tasks, full: true };
       }
     }
-    return tasks;
+    return { tasks, full: false };
   }
 
-  /** 当前批次及其补译结束后再处理下一批，使译文按阅读顺序逐批显示。@returns {void} 无返回值。 */
-  pump() {
+  /**
+   * 满批立即发送；不足一批时只启动一次 200 毫秒窗口，避免逐条更新产生零散请求或持续延后。
+   * 满批和窗口到期统一经过发送前检查；命中照常即时显示。
+   * 同一会话始终只有一个网络批次，拆批补译也共享此名额。
+   * @param {boolean} [flush] 是否已等完聚合窗口，允许发送尾批。
+   * @returns {void} 无返回值。
+   */
+  pump(flush = false) {
     if (!this.active) return;
-    if (!this.workers) {
-      const tasks = this.nextBatch();
-      if (tasks.length) {
-        this.workers++;
-        this.phase = "translating";
-        void this.runBatch(tasks, this.runId);
+    if (!this.workers && !this.dispatchToken) {
+      const { tasks, full } = this.nextBatch();
+      if (!tasks.length || full || flush) {
+        clearTimeout(this.batchTimer);
+        this.batchTimer = null;
+        if (tasks.length) {
+          void this.dispatchBatch(flush);
+        }
+      } else if (!this.batchTimer) {
+        const runId = this.runId;
+        const timer = setTimeout(() => {
+          if (!this.active || this.runId !== runId || this.batchTimer !== timer) return;
+          this.batchTimer = null;
+          void this.dispatchBatch(true);
+        }, BATCH_WAIT_MS);
+        this.batchTimer = timer;
       }
     }
-    if (!this.workers) this.phase = "watching";
+    if (!this.workers)
+      this.phase =
+        this.batchTimer ||
+        this.dispatchToken ||
+        [...this.units.values()].some((unit) =>
+          unit.chunks.some((chunk) => chunk.state === "checking"),
+        )
+          ? "translating"
+          : "watching";
     this.publish();
   }
 
   /** 请求批次；输出不完整时二分缩小失败范围，单片段失败仍保留原文供手动重试。@param {Object[]} tasks 片段任务。@param {string} runId 运行代号。@param {boolean} [subBatch] 是否共用父批次的并发名额。@returns {Promise<void>} 批次及其补译结束。 */
   async runBatch(tasks, runId, subBatch = false) {
     if (!this.active || runId !== this.runId) return;
+    if (subBatch) {
+      this.scan();
+      tasks = tasks.filter(({ unit, chunk }) => {
+        if (this.units.get(unit.element) !== unit) return false;
+        if (this.scope && !this.scope.has(unit.element)) {
+          chunk.state = "pending";
+          return false;
+        }
+        return true;
+      });
+      if (!tasks.length) return;
+    }
+    const cacheRevision = this.cacheRevision;
     try {
       const translated = await sendMessage({
         type: "TRANSLATE_BATCH",
         runId,
         signature: this.config.signature,
-        segments: tasks.map(({ chunk }) => ({
-          id: chunk.id,
-          parts: chunk.parts,
-          ...(chunk.context ? { context: chunk.context } : {}),
-        })),
+        segments: segmentsOf(tasks),
       });
       if (!this.active || runId !== this.runId) return;
       const results = new Map(translated.map((item) => [item.id, item.parts]));
@@ -397,11 +648,12 @@ export class TranslationEngine {
           chunk.translated = results.get(chunk.id);
           chunk.state = "done";
           if (unit.chunks.every((item) => item.state === "done")) {
-            this.remember(unit);
+            if (cacheRevision === this.cacheRevision) this.remember(unit);
             this.renderUnit(unit);
           }
         }
       });
+      if (this.config.visibleOnly) this.scheduleScan(60);
     } catch (error) {
       if (!this.active || runId !== this.runId) return;
       // 格式错误只说明当前响应不可用；缩小批次后，其他段落仍可能正常返回。
