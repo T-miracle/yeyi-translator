@@ -205,6 +205,7 @@ async function handleMessage(message, sender) {
               "translationShortcut",
               "autoTranslateSites",
               "visibleOnly",
+              "optimizeChineseFont",
               "cacheEnabled",
               "cacheLimitMb",
             ].includes(key),
@@ -337,6 +338,7 @@ async function handleMessage(message, sender) {
           settings,
           segments: message.segments,
           signal: controller.signal,
+          retryFragments: message.retryFragments === true,
         });
       } finally {
         inflight.delete(requestId);

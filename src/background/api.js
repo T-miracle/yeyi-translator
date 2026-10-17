@@ -1,4 +1,5 @@
 import { completionUrl, modelsUrl, LANGUAGES } from "../shared/settings.js";
+import { reasoningParameters } from "../shared/reasoning.js";
 import {
   matchingNames,
   translateNamePart,
@@ -396,6 +397,8 @@ async function delay(ms, signal) {
  * @param {AbortSignal} options.signal 页面级取消信号。
  * @param {typeof fetch} [options.fetchImpl] 测试时注入的请求替身。
  * @param {number} [options.retryDelayMs] 测试可缩短的退避基数。
+ * @param {boolean} [options.deferRetries] 页面任务把失败交还队列，不在后台等待或隐式重试。
+ * @param {boolean} [options.retryFragments] 失败队列已隔离单段时，直接逐节点请求，避免再发已知失败的整段格式。
  * @param {string[]} [options.contextParts] 补译时参考的原段全部节点原文，同时用于服务错误脱敏，不作为待译片段。
  * @param {Object[]} [options.nameDictionary] 后台读取的本机人名条目，仅发送与当前原文匹配的条目。
  * @returns {Promise<Object[]>} 完整校验的译文列表。
@@ -407,6 +410,8 @@ export async function translateBatch({
   signal,
   fetchImpl = fetch,
   retryDelayMs = 900,
+  deferRetries = false,
+  retryFragments = false,
   contextParts,
   nameDictionary = [],
 }) {
@@ -427,6 +432,8 @@ export async function translateBatch({
         signal,
         fetchImpl,
         retryDelayMs,
+        deferRetries,
+        retryFragments,
         contextParts,
         nameDictionary,
       });
@@ -436,6 +443,32 @@ export async function translateBatch({
   }
   if (!provider.apiKey)
     throw new TranslationError("NO_KEY", "请先在设置中填写当前服务的 API Key。", { fatal: true });
+  /** 单段补译保留完整原文上下文；页面队列中的每个节点每轮只请求一次，取消后立即结束。 */
+  async function translateFragments(segment) {
+    const parts = [];
+    for (const part of segment.parts) {
+      signal.throwIfAborted();
+      if (!/\p{L}/u.test(part)) {
+        parts.push(part);
+        continue;
+      }
+      const [fragment] = await translateBatch({
+        provider,
+        targetLanguage,
+        segments: [{ id: segment.id, parts: [part] }],
+        contextParts: [...(segment.context ? [segment.context] : []), ...segment.parts],
+        signal,
+        fetchImpl,
+        retryDelayMs,
+        deferRetries,
+        nameDictionary,
+      });
+      parts.push(fragment.parts[0]);
+    }
+    return [{ id: segment.id, parts }];
+  }
+  if (retryFragments && segments.length === 1 && segments[0].parts.length > 1)
+    return translateFragments(segments[0]);
   const endpoint = completionUrl(provider.baseUrl);
   const contextText = contextParts?.join("");
   const request = {
@@ -456,8 +489,8 @@ export async function translateBatch({
       },
     ],
     response_format: { type: "json_object" },
+    ...reasoningParameters(provider),
   };
-  if (new URL(endpoint).hostname === "api.deepseek.com") request.thinking = { type: "disabled" };
   for (let attempt = 0; attempt < 3; attempt++) {
     signal.throwIfAborted();
     const controller = new AbortController();
@@ -552,32 +585,13 @@ export async function translateBatch({
     }
     // 段落已经缩小到一个单元格仍可能包含多份内联文字；逐节点补译避开模型合并 parts 的失败模式。
     // 补译只递归到单节点；单节点仍失败时仅使用既有的有限重试策略。
+    if (deferRetries) throw failure;
     if (
       ["OUTPUT_INVALID", "OUTPUT_INCOMPLETE", "OUTPUT_UNTRANSLATED"].includes(failure.code) &&
       segments.length === 1 &&
       segments[0].parts.length > 1
     ) {
-      const segment = segments[0];
-      const parts = [];
-      for (const part of segment.parts) {
-        signal.throwIfAborted();
-        if (!/\p{L}/u.test(part)) {
-          parts.push(part);
-          continue;
-        }
-        const [fragment] = await translateBatch({
-          provider,
-          targetLanguage,
-          segments: [{ id: segment.id, parts: [part] }],
-          contextParts: [...(segment.context ? [segment.context] : []), ...segment.parts],
-          signal,
-          fetchImpl,
-          retryDelayMs,
-          nameDictionary,
-        });
-        parts.push(fragment.parts[0]);
-      }
-      return [{ id: segment.id, parts }];
+      return translateFragments(segments[0]);
     }
     if (!failure.retryable || attempt === 2) throw failure;
     await delay(retryDelayMs * 2 ** attempt, signal);

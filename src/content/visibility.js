@@ -33,20 +33,30 @@ export function hasVisibleText(records, { viewportOnly = true, clipRoot } = {}) 
         Number(style.opacity) === 0
       )
         return false;
-      const rect = element.getBoundingClientRect();
       const clips = viewportOnly ? /hidden|clip|scroll|auto/ : /hidden|clip/;
       const clipX = !outsideScrollContent && clips.test(style.overflowX);
       const clipY = !outsideScrollContent && clips.test(style.overflowY);
-      if (clipX) {
-        bounds.left = Math.max(bounds.left, rect.left + element.clientLeft);
-        bounds.right = Math.min(bounds.right, rect.left + element.clientLeft + element.clientWidth);
-      }
-      if (clipY) {
-        bounds.top = Math.max(bounds.top, rect.top + element.clientTop);
-        bounds.bottom = Math.min(
-          bounds.bottom,
-          rect.top + element.clientTop + element.clientHeight,
-        );
+      if (clipX || clipY) {
+        let viewportElement = element === doc.documentElement || element === doc.scrollingElement;
+        if (!viewportElement && element === doc.body) {
+          const rootStyle = view.getComputedStyle(doc.documentElement);
+          viewportElement = rootStyle.overflowX === "visible" && rootStyle.overflowY === "visible";
+        }
+        // 根元素及向视口传播 overflow 的 body 裁剪视口本身，不能使用滚动后的负坐标。
+        // 普通列表仍按自身客户区裁剪，避免将内部滚动区域外的文字误判为可见。
+        const rect = viewportElement ? null : element.getBoundingClientRect();
+        const left = viewportElement ? 0 : rect.left + element.clientLeft;
+        const top = viewportElement ? 0 : rect.top + element.clientTop;
+        const width = viewportElement ? view.innerWidth : element.clientWidth;
+        const height = viewportElement ? view.innerHeight : element.clientHeight;
+        if (clipX) {
+          bounds.left = Math.max(bounds.left, left);
+          bounds.right = Math.min(bounds.right, left + width);
+        }
+        if (clipY) {
+          bounds.top = Math.max(bounds.top, top);
+          bounds.bottom = Math.min(bounds.bottom, top + height);
+        }
       }
       if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return false;
       // 滚动内容使用自己的坐标空间；外层页面 overflow:hidden 不代表列表中的离屏文字永久隐藏。

@@ -186,6 +186,7 @@ export async function translateWithCache({
   settings,
   segments,
   signal,
+  retryFragments = false,
   translate = translateBatch,
 }) {
   validateSegments(segments);
@@ -195,6 +196,9 @@ export async function translateWithCache({
     nameDictionary: settings.nameDictionary || [],
     segments,
     signal,
+    // 页面重试统一由内容脚本的失败队列调度；不改变缓存键、文件格式或已有条目。
+    deferRetries: true,
+    retryFragments,
   };
   if (!settings.cacheEnabled) return translate(request);
   const revision = cache.revision;

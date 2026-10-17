@@ -122,7 +122,7 @@ test("新插入顶部的段落按页面位置优先，不按加入队列的时�
   }
 });
 
-test("上方批次的拆批补译完成前，下方段落保持等待", async () => {
+test("上方批次失败进入低优先级队列，下方待译内容先完成", async () => {
   const page = await startPage();
   try {
     assert.equal(await page.evaluate(() => requests.length), 1);
@@ -130,17 +130,17 @@ test("上方批次的拆批补译完成前，下方段落保持等待", async ()
     await expect.poll(() => page.evaluate(() => requests.length)).toBe(2);
     assert.deepEqual(
       await batchTexts(page, 1),
-      Array.from({ length: 9 }, (_, index) => `Paragraph ${index}`),
+      Array.from({ length: 18 }, (_, index) => `Paragraph ${index + 18}`),
     );
     await complete(page, 1);
     await expect.poll(() => page.evaluate(() => requests.length)).toBe(3);
     assert.deepEqual(
       await batchTexts(page, 2),
-      Array.from({ length: 9 }, (_, index) => `Paragraph ${index + 9}`),
+      Array.from({ length: 4 }, (_, index) => `Paragraph ${index + 36}`),
     );
     await complete(page, 2);
     await expect.poll(() => page.evaluate(() => requests.length)).toBe(4);
-    assert.equal((await batchTexts(page, 3))[0], "Paragraph 18");
+    assert.deepEqual(await batchTexts(page, 3), ["Paragraph 0"]);
   } finally {
     await page.close();
   }

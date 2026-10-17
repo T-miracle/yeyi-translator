@@ -1,4 +1,9 @@
 import { normalizeShortcut } from "./shortcut.js";
+import {
+  normalizeReasoningEffort,
+  normalizeThinkingMode,
+  reasoningSignature,
+} from "./reasoning.js";
 
 /** @typedef {'deepseek'|'openai'} ProviderId 支持的 API 服务。 */
 /**
@@ -6,6 +11,8 @@ import { normalizeShortcut } from "./shortcut.js";
  * @property {string} apiKey 用户自己的密钥，仅允许扩展可信上下文读取。
  * @property {string} baseUrl API 根地址或完整的 Chat Completions 地址。
  * @property {string} model 用户可修改的模型名称。
+ * @property {string} reasoningEffort 推理档位；default 表示不指定，none 表示关闭思考。
+ * @property {'disabled'|'enabled'|'default'} [thinkingMode] DeepSeek 独立思考开关，推理档位仅开启时生效。
  */
 /**
  * @typedef {Object} Settings 持久设置；不包含网页或译文缓存。
@@ -16,6 +23,7 @@ import { normalizeShortcut } from "./shortcut.js";
  * @property {boolean} showFloatingButton 是否显示网页入口。
  * @property {string} translationShortcut 切换翻译与恢复原文的快捷键；空字符串表示停用。
  * @property {boolean} visibleOnly 是否只翻译当前视口可见的段落。
+ * @property {boolean} optimizeChineseFont 是否为中文译文优先使用本机中文字体。
  * @property {boolean} cacheEnabled 是否跨页面、刷新和重启保存译文缓存。
  * @property {number} cacheLimitMb 缓存容量提醒阈值（MiB），超出后继续保存。
  * @property {string[]} autoTranslateSites 精确匹配的主机名，不隐式包含子域。
@@ -41,14 +49,26 @@ export const LANGUAGES = [
 export const DEFAULT_SETTINGS = {
   provider: "deepseek",
   providers: {
-    deepseek: { apiKey: "", baseUrl: "https://api.deepseek.com", model: "deepseek-flash" },
-    openai: { apiKey: "", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1-mini" },
+    deepseek: {
+      apiKey: "",
+      baseUrl: "https://api.deepseek.com",
+      model: "deepseek-flash",
+      thinkingMode: "disabled",
+      reasoningEffort: "default",
+    },
+    openai: {
+      apiKey: "",
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-4.1-mini",
+      reasoningEffort: "default",
+    },
   },
   targetLanguage: "zh-CN",
   mode: "bilingual",
   showFloatingButton: true,
   translationShortcut: "Ctrl+X",
   visibleOnly: false,
+  optimizeChineseFont: false,
   cacheEnabled: false,
   cacheLimitMb: 512,
   autoTranslateSites: [],
@@ -123,6 +143,18 @@ export function normalizeSettings(input = {}) {
       baseUrl: normalizeBaseUrl(String(candidate.baseUrl ?? defaults.baseUrl)),
       model: String(candidate.model ?? defaults.model).trim(),
     };
+    providers[id].reasoningEffort = normalizeReasoningEffort(
+      candidate.reasoningEffort,
+      providers[id].baseUrl,
+    );
+    if (id === "deepseek") {
+      // 仅补齐读取结果，不主动重写存档；旧 none/具体档位分别还原为关闭/开启。
+      providers[id].thinkingMode = normalizeThinkingMode(
+        candidate.thinkingMode,
+        providers[id].reasoningEffort,
+      );
+      if (providers[id].reasoningEffort === "none") providers[id].reasoningEffort = "default";
+    }
     if (!providers[id].model || providers[id].model.length > 200) {
       throw new Error("模型名称不能为空，且不能超过 200 个字符。");
     }
@@ -139,6 +171,7 @@ export function normalizeSettings(input = {}) {
       input.translationShortcut ?? DEFAULT_SETTINGS.translationShortcut,
     ),
     visibleOnly: input.visibleOnly === true,
+    optimizeChineseFont: input.optimizeChineseFont === true,
     cacheEnabled: input.cacheEnabled === true,
     cacheLimitMb,
     autoTranslateSites: normalizeSites(input.autoTranslateSites || []),
@@ -151,14 +184,20 @@ export function publicSettings(settings) {
   const signature = [settings.provider, current.baseUrl, current.model, settings.targetLanguage];
   // 无有效字典时保持旧缓存键兼容；摘要不向网页暴露人名及描述。
   if (settings.nameDictionarySignature) signature.push(settings.nameDictionarySignature);
+  const reasoning = reasoningSignature(current);
+  if (reasoning) signature.push(["reasoning", reasoning]);
   return {
     provider: settings.provider,
     model: current.model,
+    reasoningEffort: current.reasoningEffort,
+    thinkingMode: current.thinkingMode,
+    reasoningSignature: reasoning,
     targetLanguage: settings.targetLanguage,
     mode: settings.mode,
     showFloatingButton: settings.showFloatingButton,
     translationShortcut: settings.translationShortcut,
     visibleOnly: settings.visibleOnly,
+    optimizeChineseFont: settings.optimizeChineseFont,
     cacheEnabled: settings.cacheEnabled,
     nameDictionarySignature: settings.nameDictionarySignature || "",
     autoTranslateSites: settings.autoTranslateSites,

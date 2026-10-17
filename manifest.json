@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "页译 · 整页 AI 翻译",
-  "version": "1.3.0",
+  "version": "1.3.6",
   "description": "用自己的 DeepSeek / OpenAI Key 翻译网页。支持替换译文、段落双语、动态内容及恢复原文。",
   "minimum_chrome_version": "120",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting"],

@@ -117,7 +117,7 @@ export class SettingsPanel {
       state.error ||
       (state.phase === "idle"
         ? "点击翻译，开始阅读。"
-        : `${state.done} / ${state.total} 段已完成${state.failed ? ` · ${state.failed} 段失败，可重试` : state.phase === "watching" ? " · 已完成" : state.phase === "paused" ? " · 已暂停" : " · 正在翻译"}`);
+        : `${state.done} / ${state.total} 段已完成${state.retrying ? ` · ${state.retrying} 段等待重试（最多 3 次）` : state.failed ? ` · ${state.failed} 段失败，可重试` : state.phase === "watching" ? " · 已完成" : state.phase === "paused" ? " · 已暂停" : " · 正在翻译"}`);
     status.classList.toggle("error", Boolean(state.error || state.failed));
     const pause = this.element.querySelector('[data-action="toggle-pause"]');
     pause.hidden = !state.total || state.phase === "error";

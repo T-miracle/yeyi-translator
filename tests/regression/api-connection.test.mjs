@@ -33,6 +33,69 @@ function completionResponse(translations) {
   );
 }
 
+test("页面队列模式遇到网络或格式失败只请求一次，不在后台重试或补译", async () => {
+  for (const invalid of [true, false]) {
+    let requests = 0;
+    await assert.rejects(() =>
+      translateBatch({
+        provider: {
+          apiKey: "test-only-secret",
+          baseUrl: "https://proxy.example/v1",
+          model: "custom-chat",
+        },
+        targetLanguage: "zh-CN",
+        segments: [{ id: "body", parts: ["Read", "the guide"] }],
+        signal: new AbortController().signal,
+        deferRetries: true,
+        retryDelayMs: 0,
+        fetchImpl: async () => {
+          requests++;
+          return invalid
+            ? completionResponse([{ id: "body", parts: ["合并译文"] }])
+            : new Response("{}", { status: 503 });
+        },
+      }),
+    );
+    assert.equal(requests, 1);
+  }
+});
+
+test("失败队列逐节点补译跳过整段请求，每轮每个节点只请求一次且完整上下文脱敏", async () => {
+  const requests = [];
+  await assert.rejects(
+    () =>
+      translateBatch({
+        provider: {
+          apiKey: "test-only-secret",
+          baseUrl: "https://proxy.example/v1",
+          model: "custom-chat",
+        },
+        targetLanguage: "zh-CN",
+        segments: [{ id: "body", parts: ["Video", "Private sibling source.", "Audio"] }],
+        signal: new AbortController().signal,
+        deferRetries: true,
+        retryFragments: true,
+        retryDelayMs: 0,
+        fetchImpl: async (_url, options) => {
+          const body = JSON.parse(JSON.parse(options.body).messages[1].content);
+          requests.push(body);
+          return requests.length === 1
+            ? completionResponse([{ id: "body", parts: ["视频"] }])
+            : new Response(JSON.stringify({ error: { message: "Private sibling source." } }), {
+                status: 503,
+              });
+        },
+      }),
+    (error) => !error.message.includes("Private sibling source."),
+  );
+  assert.equal(requests.length, 2);
+  assert.deepEqual(
+    requests.map((request) => request.segments[0].parts),
+    [["Video"], ["Private sibling source."]],
+  );
+  assert.equal(requests[1].context, "VideoPrivate sibling source.Audio");
+});
+
 test("逐节点补译的服务错误不会回显整段中其他节点的原文", async () => {
   const sibling = "Private sibling original sentence.";
   let requests = 0;

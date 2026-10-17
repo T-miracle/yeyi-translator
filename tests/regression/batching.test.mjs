@@ -95,6 +95,152 @@ async function append(page, texts, scan = true) {
   );
 }
 
+/** 释放一次请求，精确检查失败任务与正常任务的派发顺序。 */
+async function reply(page, index, code, fatal = false) {
+  await page.evaluate(
+    ({ index, code, fatal }) => {
+      const { message, resolve } = requests[index];
+      resolve(
+        code
+          ? { ok: false, error: { code, fatal, message: "合成请求失败" } }
+          : {
+              ok: true,
+              data: message.segments.map(({ id, parts }) => ({
+                id,
+                parts: parts.map((part) => `译文：${part}`),
+              })),
+            },
+      );
+    },
+    { index, code, fatal },
+  );
+}
+
+test("失败批次让出 worker，先翻译正常尾批，再逐项重试且失败项不插队", async (t) => {
+  const page = await startPage(
+    t,
+    Array.from({ length: 40 }, (_, i) => `<p>Source ${i}.</p>`).join(""),
+  );
+  await reply(page, 0, "OUTPUT_INVALID");
+  await page.clock.runFor(1);
+  assert.equal((await batches(page))[1][0], "Source 18.");
+  await reply(page, 1);
+  await page.clock.runFor(200);
+  assert.deepEqual((await batches(page))[2], [
+    "Source 36.",
+    "Source 37.",
+    "Source 38.",
+    "Source 39.",
+  ]);
+  await reply(page, 2);
+  await page.clock.runFor(800);
+  assert.deepEqual((await batches(page))[3], ["Source 0."]);
+  await reply(page, 3, "OUTPUT_INVALID");
+  await page.clock.runFor(1);
+  assert.deepEqual((await batches(page))[4], ["Source 1."]);
+  assert.equal(await page.locator("[data-yeyi-owned=translation]").count(), 22);
+});
+
+test("每段首次失败后最多自动重试三次，扫描和继续不会重置，手动重试才重新计数", async (t) => {
+  const page = await startPage(t, "<p>Always failing source.</p>");
+  await page.clock.runFor(200);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await reply(page, attempt, "NETWORK");
+    if (attempt < 3) {
+      assert.equal(await page.evaluate(() => engine.getState().retrying), 1);
+      await page.clock.runFor(1000 * 2 ** attempt - 1);
+      assert.equal((await batches(page)).length, attempt + 1);
+      await page.clock.runFor(1);
+    }
+  }
+  await page.evaluate(() => {
+    engine.scan();
+    engine.pump();
+    engine.start(config, false);
+  });
+  await page.clock.runFor(100_000);
+  assert.equal((await batches(page)).length, 4);
+  assert.equal(await page.evaluate(() => engine.getState().failed), 1);
+  assert.equal(await page.evaluate(() => engine.getState().retrying), 0);
+  assert.equal(await page.locator("[data-yeyi-owned=translation]").count(), 0);
+  await page.evaluate(() => engine.start(config, true));
+  await page.clock.runFor(200);
+  await reply(page, 4);
+  assert.equal(await page.evaluate(() => engine.getState().done), 1);
+  assert.equal(await page.evaluate(() => engine.getState().error), "");
+});
+
+test("退避期间新增正文优先发送，不等待失败队列的定时器", async (t) => {
+  const page = await startPage(t, "<p>Bad source.</p>");
+  await page.clock.runFor(200);
+  await reply(page, 0, "NETWORK");
+  await page.clock.runFor(100);
+  await append(page, ["New healthy source."]);
+  await page.clock.runFor(200);
+  assert.deepEqual((await batches(page))[1], ["New healthy source."]);
+  await reply(page, 1);
+  await page.clock.runFor(700);
+  assert.deepEqual((await batches(page))[2], ["Bad source."]);
+});
+
+test("失败队列派发前移除或隐藏节点，不发送过期原文", async (t) => {
+  const page = await startPage(
+    t,
+    '<p id="gone">Removed source.</p><p id="hidden">Hidden source.</p>',
+  );
+  await page.clock.runFor(200);
+  await reply(page, 0, "NETWORK");
+  await page.evaluate(() => {
+    document.querySelector("#gone").remove();
+    document.querySelector("#hidden").hidden = true;
+  });
+  await page.clock.runFor(10_000);
+  assert.equal((await batches(page)).length, 1);
+  assert.equal(await page.evaluate(() => engine.getState().total), 0);
+});
+
+test("暂停、恢复原文会取消重试唤醒，旧请求不能写入新会话", async (t) => {
+  const page = await startPage(t, "<p>Retry cancellation source.</p>");
+  await page.clock.runFor(200);
+  await reply(page, 0, "NETWORK");
+  await page.evaluate(() => engine.stop());
+  await page.clock.runFor(10_000);
+  assert.equal((await batches(page)).length, 1);
+  await page.evaluate(() => engine.start(config, false));
+  await page.clock.runFor(1);
+  assert.equal((await batches(page)).length, 2);
+  await page.evaluate(() => engine.restore());
+  await reply(page, 1);
+  await page.clock.runFor(10_000);
+  assert.equal(await page.locator("[data-yeyi-owned=translation]").count(), 0);
+  assert.equal(await page.evaluate(() => engine.getState().total), 0);
+});
+
+test("鉴权等致命失败保留原文并停止，不进入自动失败重试队列", async (t) => {
+  const page = await startPage(
+    t,
+    Array.from({ length: 25 }, (_, i) => `<p>Source ${i}.</p>`).join(""),
+  );
+  await reply(page, 0, "AUTH", true);
+  await page.clock.runFor(10_000);
+  assert.equal((await batches(page)).length, 1);
+  assert.equal(await page.evaluate(() => engine.getState().active), false);
+  assert.equal(await page.evaluate(() => engine.getState().phase), "error");
+});
+
+test("多节点格式失败进入队列，下次直接逐节点补译并沿用原缓存段落", async (t) => {
+  const page = await startPage(t, "<p>Read <b>the guide</b> today.</p>");
+  await page.clock.runFor(200);
+  await reply(page, 0, "OUTPUT_INCOMPLETE");
+  await page.clock.runFor(1000);
+  const sent = await page.evaluate(() => requests.map((request) => request.message));
+  assert.equal(sent[0].retryFragments, false);
+  assert.equal(sent[1].retryFragments, true);
+  assert.deepEqual(sent[1].segments, sent[0].segments);
+  await reply(page, 1);
+  assert.equal(await page.evaluate(() => engine.getState().done), 1);
+});
+
 test("连续多次入队先聚合，200 毫秒到期只发一个请求且不因新增内容延后", async (t) => {
   const page = await startPage(t, "<p>First source.</p>");
   assert.deepEqual(await batches(page), []);

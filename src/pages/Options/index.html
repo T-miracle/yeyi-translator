@@ -28,7 +28,7 @@
         <div class="sidebar-note">
           <span class="mini-mark">译</span>
           <p>语言之间，<br />少一点距离。</p>
-          <small>Chrome & Edge<br />Manifest V3 · v1.3.0</small>
+          <small>Chrome & Edge<br />Manifest V3 · v1.3.6</small>
         </div>
       </aside>
       <main>
@@ -106,6 +106,18 @@
                   </label>
                 </div>
                 <label class="field"
+                  ><span class="field-title">思考模式</span
+                  ><select name="deepseekThinkingMode" aria-label="DeepSeek 思考模式"></select>
+                  <p class="hint">独立控制是否思考。接口默认由服务端决定。</p></label
+                >
+                <label class="field"
+                  ><span class="field-title">推理级别</span
+                  ><select name="deepseekReasoningEffort" aria-label="DeepSeek 推理级别"></select>
+                  <p class="hint">
+                    仅在思考模式选择“开启”时生效。调整级别不会开启思考，更高级别通常耗时、用量更多。
+                  </p></label
+                >
+                <label class="field"
                   ><span class="field-title">Base URL</span
                   ><input
                     name="deepseekUrl"
@@ -116,7 +128,7 @@
                 <div class="provider-footer">
                   <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer"
                     >获取 Key ↗</a
-                  ><button type="button" class="test-button" data-test="deepseek">
+                  ><button type="button" class="test-button" data-test="deepseek" disabled>
                     测试连接 ↗
                   </button>
                 </div>
@@ -178,6 +190,13 @@
                   </label>
                 </div>
                 <label class="field"
+                  ><span class="field-title">推理级别</span
+                  ><select name="openaiReasoningEffort" aria-label="OpenAI 推理级别"></select>
+                  <p class="hint">
+                    非推理模型请选择接口默认；可用档位取决于模型。更高档位通常耗时、用量更多。
+                  </p></label
+                >
+                <label class="field"
                   ><span class="field-title">Base URL</span
                   ><input
                     name="openaiUrl"
@@ -188,7 +207,9 @@
                 <div class="provider-footer">
                   <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer"
                     >获取 Key ↗</a
-                  ><button type="button" class="test-button" data-test="openai">测试连接 ↗</button>
+                  ><button type="button" class="test-button" data-test="openai" disabled>
+                    测试连接 ↗
+                  </button>
                 </div>
                 <p class="hint test-result" data-result="openai" role="status"></p>
               </fieldset>
@@ -234,6 +255,20 @@
                   name="visibleOnly"
                   type="checkbox"
                   aria-label="只翻译可视页面" /><span></span
+              ></label>
+            </div>
+            <div class="preference-toggle">
+              <div>
+                <strong>中文译文字体优化</strong>
+                <p class="hint">
+                  默认关闭。为中文译文优先使用本机中文字体，减少缺字回退造成的粗细不一；保留原有字号、字重、颜色与排版
+                </p>
+              </div>
+              <label class="switch"
+                ><input
+                  name="optimizeChineseFont"
+                  type="checkbox"
+                  aria-label="中文译文字体优化" /><span></span
               ></label>
             </div>
             <div class="preference-toggle shortcut-preference">
@@ -310,7 +345,8 @@
                 <div>
                   <strong>启用持久翻译缓存</strong>
                   <p class="hint">
-                    默认关闭。命中缓存立即显示，仅未命中内容排队；刷新页面或重启浏览器后仍有效
+                    默认关闭。优先复用缓存，仅未命中内容排队；Discord
+                    滚动停稳后显示，重启浏览器后仍有效
                   </p>
                 </div>
                 <label class="switch"
@@ -460,8 +496,13 @@
             </p>
           </div>
           <div class="save-bar">
-            <div id="saveStatus" role="status">设置保存后生效</div>
-            <button type="submit" class="button primary" id="saveButton">
+            <div>
+              <div id="saveStatus" role="status">正在读取设置…</div>
+              <button type="button" class="button quiet" id="reloadExtension" hidden>
+                重新加载扩展
+              </button>
+            </div>
+            <button type="submit" class="button primary" id="saveButton" disabled>
               保存设置 <span>↗</span>
             </button>
           </div>

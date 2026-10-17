@@ -575,7 +575,7 @@ try {
   }
   fixture.state.mode = "success";
 
-  await scenario("临时服务故障最多自动重试两次后恢复翻译", async () => {
+  await scenario("临时服务故障进入失败队列，并在三次重试上限内恢复翻译", async () => {
     await page.reload();
     fixture.state.transientRemaining = 2;
     const before = fixture.requests.length;
@@ -585,7 +585,17 @@ try {
       "阅读 指南 并探索。",
       { timeout: 15_000 },
     );
-    assert.equal(fixture.requests.length, before + 3);
+    await expect(page.locator("[data-yeyi-owned=control]").locator(".status")).toHaveText(
+      /段已完成 · 已完成$/,
+      { timeout: 15_000 },
+    );
+    const attempts = new Map();
+    for (const request of fixture.requests.slice(before)) {
+      for (const segment of JSON.parse(request.body.messages.at(-1).content).segments)
+        attempts.set(segment.id, (attempts.get(segment.id) || 0) + 1);
+    }
+    assert(fixture.requests.length >= before + 3);
+    assert([...attempts.values()].every((count) => count <= 4));
     await page.getByRole("button", { name: "恢复原文", exact: true }).click();
   });
 
@@ -596,7 +606,7 @@ try {
     await page.getByRole("button", { name: "打开翻译设置" }).click();
     await page.getByRole("button", { name: "翻译此页", exact: true }).click();
     popup = await openPopup();
-    await expect(popup.locator("#retry")).toBeVisible();
+    await expect(popup.locator("#retry")).toBeVisible({ timeout: 15_000 });
     await expect(popup.locator("#statusChip")).toHaveText("已翻译");
     assert((await page.locator(".long-paragraph [data-yeyi-owned=translation]").count()) > 0);
     await expect(page.locator(".long-paragraph [data-yeyi-owned=translation]")).toHaveCount(44);

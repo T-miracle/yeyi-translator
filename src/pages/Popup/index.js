@@ -66,13 +66,15 @@ function render() {
     elements.progressLabel.textContent = labels[phase];
     elements.progress.max = Math.max(1, state.total);
     elements.progress.value = state.done;
-    elements.progressDetail.textContent = state.failed
-      ? `${state.failed} 段未完成，已保留原文`
-      : phase === "watching"
-        ? "持续监测新内容 · 可随时暂停"
-        : phase === "paused"
-          ? "已完成的译文保留在页面中"
-          : "正在翻译页面内容";
+    elements.progressDetail.textContent = state.retrying
+      ? `${state.retrying} 段等待重试（最多 3 次），其他内容优先翻译`
+      : state.failed
+        ? `${state.failed} 段未完成，已保留原文`
+        : phase === "watching"
+          ? "持续监测新内容 · 可随时暂停"
+          : phase === "paused"
+            ? "已完成的译文保留在页面中"
+            : "正在翻译页面内容";
     elements.retry.hidden = !state.failed;
     elements.retry.disabled = busy;
   }

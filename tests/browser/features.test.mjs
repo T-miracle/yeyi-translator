@@ -71,6 +71,167 @@ const upload = (data) =>
     buffer: Buffer.from(JSON.stringify(data)),
   });
 
+test("推理级别在服务卡片内分别选择，连接测试和保存请求共用当前档位", async () => {
+  const deepseek = options.getByRole("combobox", { name: "DeepSeek 推理级别", exact: true });
+  const openai = options.getByRole("combobox", { name: "OpenAI 推理级别", exact: true });
+  assert.deepEqual(
+    await deepseek.locator("option").evaluateAll((items) => items.map((item) => item.value)),
+    ["default", "low", "high", "max"],
+  );
+  await expect(deepseek).toHaveValue("default");
+  await expect(openai).toHaveValue("default");
+  const before = (await message({ type: "GET_SETTINGS" })).data;
+  await options
+    .getByRole("combobox", { name: "DeepSeek 思考模式", exact: true })
+    .selectOption("enabled");
+  await deepseek.selectOption("max");
+  await openai.selectOption("medium");
+  await options.locator('[data-test="deepseek"]').click();
+  await expect(options.locator('[data-result="deepseek"]')).toContainText("连接成功");
+  assert.equal(fixture.requests.at(-1).body.reasoning_effort, "max");
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  const expected = structuredClone(before);
+  expected.providers.deepseek.reasoningEffort = "max";
+  expected.providers.deepseek.thinkingMode = "enabled";
+  expected.providers.openai.reasoningEffort = "medium";
+  assert.deepEqual((await message({ type: "GET_SETTINGS" })).data, expected);
+  await options.reload();
+  await expect(deepseek).toHaveValue("max");
+  await expect(
+    options.getByRole("combobox", { name: "DeepSeek 思考模式", exact: true }),
+  ).toHaveValue("enabled");
+  await expect(openai).toHaveValue("medium");
+  await options
+    .locator('[data-provider="deepseek"]')
+    .screenshot({ path: resolve(output, "reasoning-settings.png") });
+  await options.setViewportSize({ width: 390, height: 844 });
+  await options
+    .locator('[data-provider="deepseek"]')
+    .screenshot({ path: resolve(output, "reasoning-settings-mobile.png") });
+  assert.equal(
+    await options.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    true,
+  );
+  await options.setViewportSize({ width: 1280, height: 900 });
+});
+
+test("推理级别保存后重启正在翻译的页面，缓存分档保留且切回原档位可复用", async (t) => {
+  await settings({ cacheEnabled: true });
+  const page = await article(t);
+  const before = fixture.requests.length;
+  await translate(page);
+  await expect.poll(async () => (await message({ type: "GET_CACHE_STATS" })).data.count).toBe(1);
+  const original = (await message({ type: "EXPORT_CACHE" })).data.entries[0];
+  const chooseEffort = async (effort, mode = "enabled") => {
+    await options
+      .getByRole("combobox", { name: "DeepSeek 思考模式", exact: true })
+      .selectOption(mode);
+    await options
+      .getByRole("combobox", { name: "DeepSeek 推理级别", exact: true })
+      .selectOption(effort);
+    await options.locator("#saveButton").click();
+    await expect(options.locator("#saveStatus")).toContainText("已保存");
+  };
+  await chooseEffort("low");
+  await expect.poll(() => fixture.requests.length).toBe(before + 2);
+  assert.equal(fixture.requests.at(-1).body.reasoning_effort, "low");
+  await expect.poll(async () => (await message({ type: "GET_CACHE_STATS" })).data.count).toBe(2);
+  const stored = (await message({ type: "EXPORT_CACHE" })).data;
+  assert(
+    stored.entries.some(
+      (entry) =>
+        entry.key === original.key &&
+        JSON.stringify(entry.parts) === JSON.stringify(original.parts),
+    ),
+  );
+  await chooseEffort("default", "default");
+  await expect(page.locator("#source [data-yeyi-owned=translation]")).toHaveCount(1);
+  await expect
+    .poll(async () => {
+      const tabs = await worker.evaluate(() => chrome.tabs.query({}));
+      const tab = tabs.find((tab) => tab.url === page.url());
+      return worker.evaluate(
+        (tabId) => chrome.tabs.sendMessage(tabId, { type: "GET_STATE" }, { frameId: 0 }),
+        tab.id,
+      );
+    })
+    .toMatchObject({ active: true, done: 1, phase: "watching" });
+  assert.equal(fixture.requests.length, before + 2);
+  assert.deepEqual((await message({ type: "EXPORT_CACHE" })).data, stored);
+});
+
+test("关闭思考时调高推理级别不启动思考、不重译或覆盖缓存，重新开启后才按预选级别请求", async (t) => {
+  const mode = options.getByRole("combobox", { name: "DeepSeek 思考模式", exact: true });
+  const effort = options.getByRole("combobox", { name: "DeepSeek 推理级别", exact: true });
+  await mode.selectOption("disabled");
+  await effort.selectOption("low");
+  await options.locator('[name="cacheEnabled"]').check();
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  const page = await article(t);
+  const before = fixture.requests.length;
+  await translate(page);
+  assert.equal(fixture.requests.at(-1).body.reasoning_effort, "none");
+  await expect.poll(async () => (await message({ type: "GET_CACHE_STATS" })).data.count).toBe(1);
+  const original = (await message({ type: "EXPORT_CACHE" })).data;
+  await effort.selectOption("max");
+  await expect(mode).toHaveValue("disabled");
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  await expect(page.locator("#source [data-yeyi-owned=translation]")).toHaveCount(1);
+  assert.equal(fixture.requests.length, before + 1);
+  assert.deepEqual((await message({ type: "EXPORT_CACHE" })).data, original);
+  await options.reload();
+  await expect(mode).toHaveValue("disabled");
+  await expect(effort).toHaveValue("max");
+  await options.locator('[data-test="deepseek"]').click();
+  await expect(options.locator('[data-result="deepseek"]')).toContainText("连接成功");
+  assert.equal(fixture.requests.at(-1).body.reasoning_effort, "none");
+  await mode.selectOption("enabled");
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  await expect.poll(() => fixture.requests.length).toBe(before + 3);
+  assert.equal(fixture.requests.at(-1).body.reasoning_effort, "max");
+  await expect.poll(async () => (await message({ type: "GET_CACHE_STATS" })).data.count).toBe(2);
+  await mode.selectOption("disabled");
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  await expect
+    .poll(async () => {
+      const tabs = await worker.evaluate(() => chrome.tabs.query({}));
+      const tab = tabs.find((tab) => tab.url === page.url());
+      return worker.evaluate(
+        (tabId) => chrome.tabs.sendMessage(tabId, { type: "GET_STATE" }, { frameId: 0 }),
+        tab.id,
+      );
+    })
+    .toMatchObject({ active: true, done: 1, phase: "watching" });
+  assert.equal(fixture.requests.length, before + 3);
+});
+
+test("推理级别非法配置不能覆盖本机设置，OpenAI 选项完整且保存后仍可测试", async () => {
+  const before = (await message({ type: "GET_SETTINGS" })).data;
+  const invalid = structuredClone(before);
+  invalid.providers.deepseek.reasoningEffort = "bad-level";
+  const result = await message({ type: "SAVE_SETTINGS", settings: invalid });
+  assert.equal(result.ok, false);
+  assert.deepEqual((await message({ type: "GET_SETTINGS" })).data, before);
+  const openai = options.getByRole("combobox", { name: "OpenAI 推理级别", exact: true });
+  assert.deepEqual(
+    await openai.locator("option").evaluateAll((items) => items.map((item) => item.value)),
+    ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
+  await options.locator('[name="openaiUrl"]').fill(`${fixture.url}/v1`);
+  await options.locator('[name="openaiModel"]').fill("o3");
+  await options.locator('[name="openaiKey"]').fill("fixture-secret-reasoning-openai");
+  await openai.selectOption("low");
+  await options.locator('[data-test="openai"]').click();
+  await expect(options.locator('[data-result="openai"]')).toContainText("连接成功");
+  assert.equal(fixture.requests.at(-1).body.reasoning_effort, "low");
+  assert.equal(fixture.requests.at(-1).body.thinking, undefined);
+});
+
 before(async () => {
   await mkdir(output, { recursive: true });
   fixture = await startServer();
@@ -80,6 +241,7 @@ before(async () => {
 beforeEach(async () => {
   await settings({
     visibleOnly: false,
+    optimizeChineseFont: false,
     cacheEnabled: false,
     cacheLimitMb: 512,
     autoTranslateSites: [],
@@ -153,6 +315,221 @@ test("Discord 内部滚动预翻译，开关只保留在完整设置且保存后
   await expect(page.locator("#last [data-yeyi-owned=translation]")).toHaveCount(1);
   const config = await message({ type: "GET_SETTINGS" });
   assert.equal(config.data.visibleOnly, false);
+});
+
+test("X 式根元素滚动后可视翻译继续请求正文，兼容字体、缓存与恢复原文", async (t) => {
+  await settings({
+    visibleOnly: true,
+    mode: "replace",
+    optimizeChineseFont: true,
+    cacheEnabled: true,
+  });
+  const page = await article(
+    t,
+    `<style>html{height:100%;overflow-y:scroll}body{margin:0}article{height:100px;overflow:hidden}</style><main>${Array.from({ length: 50 }, (_, index) => `<article><div id="post${index}" data-testid="tweetText"><span style="font-weight:700">Search</span><span> result ${index}.</span></div></article>`).join("")}</main>`,
+  );
+  await page.evaluate(() => {
+    globalThis.postNodes = [...document.querySelector("#post22").children].map(
+      (element) => element.firstChild,
+    );
+  });
+  const before = fixture.requests.length;
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#post0")).toContainText("译文：result 0.");
+  await expect(page.locator("#post22")).toHaveText("Search result 22.");
+  await page.evaluate(() => window.scrollTo(0, 2200));
+  await expect(page.locator("#post22")).toContainText("译文：result 22.");
+  await expect(page.locator("#post30")).toContainText("译文：result 30.");
+  await expect(page.locator("#post49")).toHaveText("Search result 49.");
+  await expect(page.locator("#post22 span")).toHaveCount(2);
+  await expect(page.locator("#post22 span").first()).toHaveCSS("font-weight", "700");
+  assert.match(
+    await page
+      .locator("#post22 span")
+      .first()
+      .evaluate((element) => getComputedStyle(element).fontFamily),
+    /Microsoft YaHei/,
+  );
+  assert(
+    await page.evaluate(() =>
+      [...document.querySelector("#post22").children].every(
+        (element, index) => element.firstChild === postNodes[index],
+      ),
+    ),
+  );
+  assert.equal(
+    fixture.requests
+      .slice(before)
+      .flatMap((request) =>
+        JSON.parse(request.body.messages.at(-1).content).segments.flatMap((item) => item.parts),
+      )
+      .filter((part) => part === " result 0.").length,
+    1,
+  );
+  await page.screenshot({ path: resolve(output, "x-root-scroll.png") });
+  await page.getByRole("button", { name: "恢复原文", exact: true }).click();
+  await expect(page.locator("#post22")).toHaveText("Search result 22.");
+});
+
+test("Discord 缓存立即显示后保持阅读位置，恢复原文也不拉回滚动", async (t) => {
+  await settings({ cacheEnabled: true, mode: "replace", optimizeChineseFont: true });
+  const body = `<style>body{margin:0;overflow:hidden}#scroll{height:320px;width:400px;overflow:auto;overflow-anchor:none;position:relative}ol{list-style:none;margin:0;padding:0}li{padding:8px}p{margin:0;font:16px/24px monospace}</style><div id="app-mount"><div id="scroll"><ol data-list-id="chat-messages">${Array.from({ length: 45 }, (_, index) => `<li id="chat-messages-${index}"><p id="message-content-${index}">Preview exactly what will be downloaded before starting.</p></li>`).join("")}</ol></div></div>`;
+  const seeded = await article(t, body);
+  await seeded.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(seeded.locator("#message-content-44")).toHaveText("开始前准确预览将要下载的内容。");
+  await seeded.close();
+  await settings({ visibleOnly: true });
+  const page = await article(t, body);
+  const before = await page.evaluate(() => {
+    const scroller = document.querySelector("#scroll");
+    const anchor = document.querySelector("#chat-messages-22");
+    scroller.scrollTop = anchor.offsetTop + 8;
+    return {
+      top: anchor.getBoundingClientRect().top,
+      height: anchor.getBoundingClientRect().height,
+    };
+  });
+  const requests = fixture.requests.length;
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#message-content-22")).toHaveText("开始前准确预览将要下载的内容。");
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      }),
+  );
+  const after = await page.locator("#chat-messages-22").evaluate((element) => ({
+    top: element.getBoundingClientRect().top,
+    height: element.getBoundingClientRect().height,
+  }));
+  assert(after.height < before.height, "缓存译文应实际改变消息高度");
+  assert(Math.abs(after.top - before.top) <= 1, `缓存命中后偏移 ${after.top - before.top}px`);
+  assert.equal(fixture.requests.length, requests);
+  await page.screenshot({ path: resolve(output, "discord-cache-scroll.png") });
+  await page.getByRole("button", { name: "恢复原文", exact: true }).click();
+  await expect(page.locator("#message-content-22")).toHaveText(
+    "Preview exactly what will be downloaded before starting.",
+  );
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      }),
+  );
+  const restoredTop = await page
+    .locator("#chat-messages-22")
+    .evaluate((element) => element.getBoundingClientRect().top);
+  assert(Math.abs(restoredTop - before.top) <= 1, `恢复原文后偏移 ${restoredTop - before.top}px`);
+});
+
+test("真实扩展的译文响应在 Discord 平滑滚动中返回，不打断动画或改写消息", async (t) => {
+  await settings({ mode: "replace", optimizeChineseFont: true });
+  fixture.state.delayMs = 180;
+  t.after(() => {
+    fixture.state.delayMs = 0;
+  });
+  const page = await article(
+    t,
+    `<style>body{margin:0;overflow:hidden}#scroll{height:320px;width:400px;overflow:auto;overflow-anchor:none;position:relative}ol{list-style:none;margin:0;padding:0}li{padding:8px}p{margin:0;font:16px/24px monospace}</style><div id="app-mount"><div id="scroll"><ol data-list-id="chat-messages">${Array.from({ length: 45 }, (_, i) => `<li id="chat-messages-${i}"><p id="message-content-${i}">Preview exactly what will be downloaded before starting.</p></li>`).join("")}</ol></div></div>`,
+  );
+  await page.evaluate(() => {
+    document.querySelector("#scroll").scrollTop =
+      document.querySelector("#chat-messages-22").offsetTop;
+  });
+  const before = fixture.requests.length;
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect.poll(() => fixture.requests.length).toBeGreaterThan(before);
+  const trace = await page.evaluate(async () => {
+    const scroller = document.querySelector("#scroll");
+    const target = scroller.scrollTop - 500;
+    let writes = 0;
+    const observer = new MutationObserver((records) => {
+      writes += records.length;
+    });
+    observer.observe(document.querySelector("ol"), {
+      characterData: true,
+      childList: true,
+      attributes: true,
+      subtree: true,
+    });
+    const end = new Promise((resolve) =>
+      scroller.addEventListener("scrollend", resolve, { once: true }),
+    );
+    scroller.scrollTo({ top: target, behavior: "smooth" });
+    await end;
+    observer.disconnect();
+    return { target, actual: scroller.scrollTop, writes };
+  });
+  assert(
+    Math.abs(trace.actual - trace.target) <= 1,
+    `实际停在 ${trace.actual}，目标 ${trace.target}`,
+  );
+  assert.equal(trace.writes, 0, "运动期间扩展应保留所有聊天文本、节点及字体");
+  await expect(page.locator("#message-content-44")).toHaveText("开始前准确预览将要下载的内容。");
+  await page.screenshot({ path: resolve(output, "discord-smooth-scroll.png") });
+});
+
+test("真实失败请求不挡正常正文，每段最多三次重试，手动重试和缓存保持兼容", async (t) => {
+  await settings({ cacheEnabled: true, mode: "replace" });
+  fixture.state.malformedText = "Broken source.";
+  t.after(() => {
+    fixture.state.malformedText = "";
+  });
+  const page = await article(
+    t,
+    `<p id="broken">Broken source.</p>${Array.from({ length: 19 }, (_, i) => `<p id="healthy-${i}">Healthy source ${i}.</p>`).join("")}`,
+  );
+  const before = fixture.requests.length;
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await page.getByRole("button", { name: "打开翻译设置" }).click();
+  await expect(page.locator("#healthy-18")).toHaveText("译文：Healthy source 18.");
+  const parts = () =>
+    fixture.requests
+      .slice(before)
+      .map((request) =>
+        JSON.parse(request.body.messages.at(-1).content).segments.flatMap(
+          (segment) => segment.parts,
+        ),
+      );
+  assert.deepEqual(parts()[1], ["Healthy source 17.", "Healthy source 18."]);
+  await expect(page.locator('[data-yeyi-owned="control"]').locator(".status")).toContainText(
+    "等待重试",
+  );
+  await expect(page.getByRole("button", { name: "重试失败部分", exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  assert.equal(parts().filter((batch) => batch.includes("Broken source.")).length, 4);
+  await expect(page.locator("#healthy-0")).toHaveText("译文：Healthy source 0.");
+  assert.equal((await message({ type: "GET_CACHE_STATS" })).data.count, 19);
+  const count = fixture.requests.length;
+  fixture.state.malformedText = "";
+  await page.getByRole("button", { name: "重试失败部分", exact: true }).click();
+  await expect(page.locator("#broken")).toHaveText("译文：Broken source.");
+  assert.equal(fixture.requests.length, count + 1);
+  assert.deepEqual(parts().at(-1), ["Broken source."]);
+  assert.equal((await message({ type: "GET_CACHE_STATS" })).data.count, 20);
+  await page.reload();
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#broken")).toHaveText("译文：Broken source.");
+  assert.equal(fixture.requests.length, count + 1);
+});
+
+test("真实临时网络错误最多首次加三次请求，不叠加后台内部重试", async (t) => {
+  fixture.state.transientRemaining = 10;
+  t.after(() => {
+    fixture.state.transientRemaining = 0;
+  });
+  const page = await article(t);
+  const before = fixture.requests.length;
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await page.getByRole("button", { name: "打开翻译设置" }).click();
+  await expect(page.getByRole("button", { name: "重试失败部分", exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  assert.equal(fixture.requests.length, before + 4);
+  await page.waitForTimeout(300);
+  assert.equal(fixture.requests.length, before + 4);
+  await expect(page.locator("#source")).toHaveText("Reusable source paragraph.");
 });
 
 test("跨页面和刷新复用缓存，停用后不读取但保留原缓存", async (t) => {
@@ -353,6 +730,108 @@ test("命中缓存立即显示，同页慢请求只包含未缓存文字", async
     );
   assert.deepEqual(sources, ["Uncached slow browser source."]);
   await expect(page.locator("#missing [data-yeyi-owned=translation]")).toHaveCount(0);
+});
+
+test("中文字体开关默认关闭，保存和重启设置页保持，Key、缓存及人名字典均保留", async () => {
+  await expect(options.locator('[name="optimizeChineseFont"]')).not.toBeChecked();
+  const saved = (await message({ type: "GET_SETTINGS" })).data;
+  const signature = (await message({ type: "GET_PUBLIC_CONFIG" })).data.signature;
+  const dictionary = (await message({ type: "GET_NAME_DICTIONARY" })).data;
+  await upload({
+    format: "yeyi-translation-cache",
+    version: 1,
+    entries: [{ key: "a".repeat(64), parts: ["字体测试缓存"] }],
+  });
+  await expect(options.locator("#cacheResult")).toContainText("已导入 1 条");
+  const cache = (await message({ type: "EXPORT_CACHE" })).data;
+  await options.locator('[name="optimizeChineseFont"]').check();
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  assert.deepEqual((await message({ type: "GET_SETTINGS" })).data, {
+    ...saved,
+    optimizeChineseFont: true,
+  });
+  assert.equal((await message({ type: "GET_PUBLIC_CONFIG" })).data.signature, signature);
+  assert.deepEqual((await message({ type: "EXPORT_CACHE" })).data, cache);
+  assert.deepEqual((await message({ type: "GET_NAME_DICTIONARY" })).data, dictionary);
+  await options.reload();
+  await expect(options.locator('[name="optimizeChineseFont"]')).toBeChecked();
+  await options
+    .locator("#preferences")
+    .screenshot({ path: resolve(output, "font-preference.png") });
+});
+
+test("保存字体开关即时更新中文译文，关闭或恢复原文还原字体，字号字重及缓存请求不变", async (t) => {
+  await settings({ mode: "replace", cacheEnabled: true });
+  const page = await article(
+    t,
+    '<p id="source" lang="ja" style="font-family:Georgia; font-size:17px; font-weight:600; line-height:28px">Welcome to the open web</p>',
+  );
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#source")).toHaveText("欢迎来到开放网络");
+  const readFont = () =>
+    page.locator("#source").evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        family: style.fontFamily,
+        size: style.fontSize,
+        weight: style.fontWeight,
+        lineHeight: style.lineHeight,
+      };
+    });
+  const original = await readFont();
+  const requests = fixture.requests.length;
+  await options.locator('[name="optimizeChineseFont"]').check();
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  await expect.poll(async () => (await readFont()).family).toContain("Microsoft YaHei");
+  assert.deepEqual({ ...(await readFont()), family: original.family }, original);
+  assert.equal(fixture.requests.length, requests);
+  // 在同一文本节点重绘原文，验证真实扩展仍复用译文，且字体优化不会妨碍站点重绘。
+  await page.locator("#source").evaluate((element) => {
+    element.firstChild.data = "Welcome to the open web";
+  });
+  await expect(page.locator("#source")).toHaveText("欢迎来到开放网络");
+  assert.equal(fixture.requests.length, requests);
+  await options.locator('[name="optimizeChineseFont"]').uncheck();
+  await options.locator("#saveButton").click();
+  await expect(options.locator("#saveStatus")).toContainText("已保存");
+  await expect.poll(readFont).toEqual(original);
+  await page.getByRole("button", { name: "恢复原文", exact: true }).click();
+  await expect(page.locator("#source")).toHaveText("Welcome to the open web");
+  assert.deepEqual(await readFont(), original);
+});
+
+test("中文字体优化兼容汉字人名字典，本机命中与站点重绘均不调用 API", async (t) => {
+  await settings({ mode: "replace", optimizeChineseFont: true, cacheEnabled: true });
+  const dictionary = await worker.evaluate(() => chrome.storage.local.get("nameDictionary"));
+  t.after(() =>
+    worker.evaluate(async (stored) => {
+      if (stored.nameDictionary) await chrome.storage.local.set(stored);
+      else await chrome.storage.local.remove("nameDictionary");
+    }, dictionary),
+  );
+  const imported = await message({
+    type: "IMPORT_NAME_DICTIONARY",
+    entries: [{ src: "試験名", dst: "测试名", info: "合成字体测试" }],
+  });
+  assert.equal(imported.ok, true);
+  const requests = fixture.requests.length;
+  const page = await article(
+    t,
+    '<p id="source" lang="ja" style="font-family:Georgia">&#x8A66;&#x9A13;&#x540D;</p>',
+  );
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#source")).toHaveText("测试名");
+  assert.match(
+    await page.locator("#source").evaluate((element) => getComputedStyle(element).fontFamily),
+    /Microsoft YaHei/,
+  );
+  await page.locator("#source").evaluate((element) => {
+    element.firstChild.data = "試験名";
+  });
+  await expect(page.locator("#source")).toHaveText("测试名");
+  assert.equal(fixture.requests.length, requests);
 });
 
 for (const cacheEnabled of [false, true]) {

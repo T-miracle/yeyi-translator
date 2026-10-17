@@ -94,6 +94,28 @@ test("可视区域模式推迟十句窗口外的内容，滚动后翻译并保�
   await expect(page.locator("#first [data-yeyi-owned=translation]")).toHaveCount(1);
 });
 
+test("X 式 HTML 根滚动条在向下滚动后继续翻译可见正文及上下文", async (t) => {
+  const html = `<style>html{height:100%;overflow-y:scroll}body{margin:0}p{height:100px;margin:0}</style><main>${Array.from({ length: 50 }, (_, index) => `<article style="overflow:hidden"><p id="p${index}">Paragraph ${index}.</p></article>`).join("")}</main>`;
+  const page = await startPage(t, html);
+  await expect(page.locator("#p0 [data-yeyi-owned=translation]")).toHaveCount(1);
+  await page.evaluate(() => window.scrollTo(0, 2200));
+  await expect(page.locator("#p22 [data-yeyi-owned=translation]")).toHaveCount(1);
+  await expect(page.locator("#p27 [data-yeyi-owned=translation]")).toHaveCount(1);
+  await expect(page.locator("#p37 [data-yeyi-owned=translation]")).toHaveCount(1);
+  await expect(page.locator("#p49 [data-yeyi-owned=translation]")).toHaveCount(0);
+  assert.equal((await sentTexts(page)).filter((text) => text === "Paragraph 0.").length, 1);
+  await page.evaluate(() => engine.restore());
+  await expect(page.locator("#p22")).toHaveText("Paragraph 22.");
+});
+
+test("body 向视口传播滚动条时，在已滚动位置启动也能采集正文", async (t) => {
+  const html = `<style>html{height:100%}body{height:100%;margin:0;overflow-y:scroll}p{height:100px;margin:0}</style>${Array.from({ length: 50 }, (_, index) => `<p id="p${index}">Paragraph ${index}.</p>`).join("")}`;
+  const page = await startPage(t, html, true, 2200);
+  await expect(page.locator("#p22 [data-yeyi-owned=translation]")).toHaveCount(1);
+  await expect(page.locator("#p27 [data-yeyi-owned=translation]")).toHaveCount(1);
+  await expect(page.locator("#p49 [data-yeyi-owned=translation]")).toHaveCount(0);
+});
+
 test("Discord 内部滚动容器裁剪的内容先不翻译，内部滚动事件触发新内容", async (t) => {
   const page = await startPage(
     t,
