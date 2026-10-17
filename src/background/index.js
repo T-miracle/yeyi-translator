@@ -312,27 +312,33 @@ async function handleMessage(message, sender) {
     case "TRANSLATE_BATCH": {
       if (!sender.tab || typeof message.runId !== "string" || message.runId.length > 100)
         throw new TranslationError("FORBIDDEN", "无效的翻译请求。");
-      const settings = await getSettings();
-      if (message.signature !== publicSettings(settings).signature) {
-        throw new TranslationError(
-          "CONFIG_CHANGED",
-          "服务、目标语言或人名字典已更改，请重新点击翻译。",
-          {
-            fatal: true,
-          },
-        );
+      // 网络批次在读取设置前就登记取消信号；否则 CANCEL_RUN 若先到会找不到请求，
+      // 旧批次仍会在恢复原文后启动并继续补译。
+      const batch = message.type === "TRANSLATE_BATCH";
+      const requestId = batch ? `${sender.tab.id}:${sender.frameId}:${crypto.randomUUID()}` : "";
+      const controller = batch ? new AbortController() : null;
+      if (batch) {
+        inflight.set(requestId, {
+          tabId: sender.tab.id,
+          frameId: sender.frameId,
+          runId: message.runId,
+          controller,
+        });
       }
-      if (message.type === "LOOKUP_CACHE")
-        return lookupCachedTranslations({ cache, settings, segments: message.segments });
-      const requestId = `${sender.tab.id}:${sender.frameId}:${crypto.randomUUID()}`;
-      const controller = new AbortController();
-      inflight.set(requestId, {
-        tabId: sender.tab.id,
-        frameId: sender.frameId,
-        runId: message.runId,
-        controller,
-      });
       try {
+        const settings = await getSettings();
+        if (message.signature !== publicSettings(settings).signature) {
+          throw new TranslationError(
+            "CONFIG_CHANGED",
+            "服务、目标语言或人名字典已更改，请重新点击翻译。",
+            {
+              fatal: true,
+            },
+          );
+        }
+        if (!batch)
+          return lookupCachedTranslations({ cache, settings, segments: message.segments });
+        controller.signal.throwIfAborted();
         return await translateWithCache({
           cache,
           settings,
@@ -341,7 +347,7 @@ async function handleMessage(message, sender) {
           retryFragments: message.retryFragments === true,
         });
       } finally {
-        inflight.delete(requestId);
+        if (batch) inflight.delete(requestId);
       }
     }
     case "LIST_MODELS": {
