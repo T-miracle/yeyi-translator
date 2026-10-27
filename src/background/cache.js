@@ -1,6 +1,7 @@
 import { publicSettings } from "../shared/settings.js";
 import { translateBatch, validateSegments, TranslationError } from "./api.js";
 import { CACHE_FORMAT, validCacheEntry, validateCacheFile } from "../shared/cache-file.js";
+import { translationProfile } from "../shared/translation-profile.js";
 
 export const CACHE_PREFIX = "translationCache:v1:";
 const INDEX_KEY = "translationCacheIndexV1";
@@ -71,24 +72,36 @@ export class TranslationCache {
   }
 
   /**
-   * 合并新结果，既有条目优先，避免导入或并发请求覆盖用户已有译文。
-   * 先准备完整写入对象再提交；写入失败保留原数据并向设置页提供提示。
+   * 合并前核对实际正文，索引仅用于枚举，不能把缺失正文误判为已有缓存。
+   * 只有经过原文结构校验的翻译结果可修复无效正文或分片数量；导入始终保留本机正文。
+   * 在串行队列内再次读取，保留先完成的有效译文；一次提交正文和索引，失败不预先删除数据。
    */
-  async putMany(entries, revision = this.revision) {
+  async putMany(entries, revision = this.revision, { repairInvalid = false } = {}) {
     return this.serialize(async () => {
       if (revision !== this.revision) return { added: 0, skipped: entries.length, stale: true };
       const keys = new Set(await this.keys());
+      const valid = entries.filter(validCacheEntry);
+      const stored = await this.storage.get(valid.map((entry) => CACHE_PREFIX + entry.key));
       const updates = {};
       let added = 0;
-      for (const entry of entries) {
+      let indexChanged = false;
+      for (const entry of valid) {
         const key = CACHE_PREFIX + entry.key;
-        if (!validCacheEntry(entry) || keys.has(key)) continue;
-        keys.add(key);
+        if (Object.hasOwn(updates, key)) continue;
+        if (!keys.has(key)) {
+          keys.add(key);
+          indexChanged = true;
+        }
+        const previous = stored[key];
+        const usable =
+          validCacheEntry({ key: entry.key, parts: previous }) &&
+          previous.length === entry.parts.length;
+        if (previous !== undefined && (!repairInvalid || usable)) continue;
         updates[key] = [...entry.parts];
         added++;
       }
       if (revision !== this.revision) return { added: 0, skipped: entries.length, stale: true };
-      if (added) await this.storage.set({ ...updates, [INDEX_KEY]: [...keys] });
+      if (added || indexChanged) await this.storage.set({ ...updates, [INDEX_KEY]: [...keys] });
       this.warning = "";
       return { added, skipped: entries.length - added };
     });
@@ -137,14 +150,16 @@ export class TranslationCache {
   }
 }
 
-/** 以服务、端点、模型、目标语言、节点分片和上下文生成稳定摘要；排版与临时 ID 不影响复用。 */
+/** 以配置、原文和专用提示词版本生成摘要；仅日语使用新身份，其他旧缓存保持兼容。 */
 export async function cacheKey(signature, segment) {
+  const profile = translationProfile(segment);
   const bytes = new TextEncoder().encode(
     JSON.stringify([
       signature,
       segment.parts,
       segment.context || "",
       ...(segment.dictionaryOnly ? [true] : []),
+      ...(profile ? [["prompt", profile]] : []),
     ]),
   );
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -215,7 +230,7 @@ export async function translateWithCache({
     entries.forEach(({ key, parts }) => hits.set(key, parts));
     if (!signal.aborted) {
       try {
-        await cache.putMany(entries, revision);
+        await cache.putMany(entries, revision, { repairInvalid: true });
       } catch {
         cache.warning = "缓存写入失败，已保留现有缓存；本次译文仍可正常阅读。请检查本机存储空间。";
       }

@@ -261,8 +261,9 @@ test("并行导入、写入无覆盖，清理损坏索引仍只删除缓存", as
   assert.deepEqual(storage.data, { settings: { secret: "keep-my-key" }, unrelated: "keep-me" });
 });
 
-test("导入的分片数量不符时忽略该命中并重新翻译，避免损坏页面结构", async () => {
-  const cache = new TranslationCache(new LocalStorage());
+test("导入的分片数量不符时重新翻译并修复缓存，后续重启不再重复请求", async () => {
+  const storage = new LocalStorage();
+  const cache = new TranslationCache(storage);
   const key = await cacheKey(publicSettings(settings).signature, segment("source"));
   await cache.putMany([{ key, parts: ["错误分片一", "错误分片二"] }]);
   let calls = 0;
@@ -278,7 +279,137 @@ test("导入的分片数量不符时忽略该命中并重新翻译，避免损�
   });
   assert.equal(calls, 1);
   assert.deepEqual(result[0].parts, ["正确译文"]);
+  assert.deepEqual(
+    await lookupCachedTranslations({
+      cache: new TranslationCache(storage),
+      settings,
+      segments: [segment("next-day")],
+    }),
+    [{ id: "next-day", parts: ["正确译文"] }],
+  );
+  assert.equal((await cache.stats()).count, 1);
+  assert.deepEqual(storage.data.settings, { secret: "keep-my-key" });
 });
+
+for (const broken of [undefined, null, "invalid", [123]]) {
+  test(`索引存在但正文${broken === undefined ? "缺失" : "损坏：" + JSON.stringify(broken)}时补写，跨实例复用`, async () => {
+    const storage = new LocalStorage();
+    const key = await cacheKey(publicSettings(settings).signature, segment("source"));
+    storage.data.translationCacheIndexV1 = [CACHE_PREFIX + key];
+    if (broken !== undefined) storage.data[CACHE_PREFIX + key] = broken;
+    let calls = 0;
+    for (let visit = 0; visit < 3; visit++) {
+      const result = await translateWithCache({
+        cache: new TranslationCache(storage),
+        settings,
+        segments: [segment(`visit-${visit}`)],
+        signal,
+        translate: async ({ segments }) => {
+          calls++;
+          return [{ id: segments[0].id, parts: ["已修复译文"] }];
+        },
+      });
+      assert.deepEqual(result, [{ id: `visit-${visit}`, parts: ["已修复译文"] }]);
+    }
+    assert.equal(calls, 1);
+    assert.equal((await new TranslationCache(storage).stats()).count, 1);
+    assert.equal(storage.data.settings.secret, "keep-my-key");
+    assert.equal(storage.data.unrelated, "keep-me");
+  });
+}
+
+test("索引漏记时导入仍保留已有正文；未核对原文结构的导入不覆盖本机分片", async () => {
+  const storage = new LocalStorage();
+  const key = "d".repeat(64);
+  storage.data.translationCacheIndexV1 = [];
+  storage.data[CACHE_PREFIX + key] = ["本机第一片", "本机第二片"];
+  const cache = new TranslationCache(storage);
+  const result = await cache.importData({
+    format: "yeyi-translation-cache",
+    version: 1,
+    entries: [{ key, parts: ["导入的一片"] }],
+  });
+  assert.deepEqual(result, { added: 0, skipped: 1 });
+  assert.deepEqual((await cache.getMany([key])).get(key), ["本机第一片", "本机第二片"]);
+  assert.equal((await cache.stats()).count, 1);
+});
+
+test("修复写入失败保留全部原数据，恢复存储后可修复且正常译文不被并发请求覆盖", async () => {
+  const storage = new LocalStorage();
+  const cache = new TranslationCache(storage);
+  const key = await cacheKey(publicSettings(settings).signature, segment("source"));
+  await cache.putMany([{ key, parts: ["异常一", "异常二"] }]);
+  const before = structuredClone(storage.data);
+  storage.failWrite = true;
+  const options = {
+    cache,
+    settings,
+    segments: [segment("source")],
+    signal,
+  };
+  const failedWrite = await translateWithCache({
+    ...options,
+    translate: async () => [{ id: "source", parts: ["成功译文"] }],
+  });
+  assert.deepEqual(failedWrite[0].parts, ["成功译文"]);
+  assert.deepEqual(storage.data, before);
+  assert.match(cache.warning, /写入失败/);
+  storage.failWrite = false;
+
+  const pending = [];
+  const translate = () => new Promise((resolve) => pending.push(resolve));
+  const first = translateWithCache({ ...options, translate });
+  const second = translateWithCache({ ...options, translate });
+  while (pending.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  pending[0]([{ id: "source", parts: ["先保存的正确译文"] }]);
+  await first;
+  pending[1]([{ id: "source", parts: ["迟到的另一份译文"] }]);
+  await second;
+  assert.deepEqual((await cache.getMany([key])).get(key), ["先保存的正确译文"]);
+  assert.deepEqual(storage.data.settings, before.settings);
+  assert.equal(storage.data.unrelated, before.unrelated);
+});
+
+for (const action of ["clear", "disable"]) {
+  test(`修复重新读取正文期间${action === "clear" ? "清理" : "停用"}缓存，不写回旧请求`, async () => {
+    const storage = new LocalStorage();
+    const cache = new TranslationCache(storage);
+    const key = await cacheKey(publicSettings(settings).signature, segment("source"));
+    await cache.putMany([{ key, parts: ["异常一", "异常二"] }]);
+    const before = structuredClone(storage.data);
+    const read = storage.get.bind(storage);
+    let reads = 0;
+    const started = Promise.withResolvers();
+    const blocked = Promise.withResolvers();
+    storage.get = async (keys) => {
+      const result = await read(keys);
+      if (Array.isArray(keys) && keys.includes(CACHE_PREFIX + key) && ++reads === 2) {
+        started.resolve();
+        await blocked.promise;
+      }
+      return result;
+    };
+    const pending = translateWithCache({
+      cache,
+      settings,
+      segments: [segment("source")],
+      signal,
+      translate: async () => [{ id: "source", parts: ["迟到的修复译文"] }],
+    });
+    await started.promise;
+    const cleared = action === "clear" ? cache.clear() : cache.invalidate();
+    blocked.resolve();
+    await Promise.all([pending, cleared]);
+    if (action === "clear") {
+      assert.equal((await cache.stats()).count, 0);
+      assert.equal(storage.data[CACHE_PREFIX + key], undefined);
+    } else {
+      assert.deepEqual(storage.data, before);
+    }
+    assert.deepEqual(storage.data.settings, before.settings);
+    assert.equal(storage.data.unrelated, before.unrelated);
+  });
+}
 
 test("大文件完整验证后分批导入，单条异常与中途清理均有明确错误", async () => {
   const entries = Array.from({ length: 8 }, (_, index) => ({

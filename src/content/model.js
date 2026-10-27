@@ -1,3 +1,5 @@
+import { isJapaneseText } from "../shared/translation-profile.js";
+
 const SKIP =
   'script,style,noscript,pre,kbd,samp,textarea,input,select,option,svg,math,canvas,video,audio,[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate,[data-yeyi-owned]';
 const PROSE = "article,main,[role=main],[role=article],.markdown-body";
@@ -213,10 +215,10 @@ export function isChineseText(text) {
   return !sentence && !(words.length >= 3 && lowercase >= 2 && latinLength > han.length);
 }
 
-/** 将中文与外文分开，中文及纯标点在本地保留；同一节点的片段顺序用于无损拼接。@param {string} text 节点原文。@param {boolean} preserveAll 是否整段已经为中文。@returns {Array<{text:string,preserve:boolean}>} 按原顺序排列的文本片段。 */
-export function textFragments(text, preserveAll = false) {
+/** 将中文与外文分开；日语段落保留完整语义，节点顺序用于无损拼接。@param {string} text 节点原文。@param {boolean} preserveAll 是否整段已经为中文。@param {boolean} japanese 是否属于日语段落。@returns {Array<{text:string,preserve:boolean}>} 文本片段。 */
+export function textFragments(text, preserveAll = false, japanese = false) {
   if (preserveAll) return [{ text, preserve: true }];
-  if (/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text))
+  if (japanese || /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text))
     return [{ text, preserve: !/\p{L}/u.test(text) }];
   return text
     .split(/(\p{Script=Han}[\p{Script=Han}\p{M}\s，。！？；：、“”‘’（）《》【】…—]*)/u)
@@ -227,10 +229,14 @@ export function textFragments(text, preserveAll = false) {
     }));
 }
 
-/** 为外文及本机字典检查构造有界任务；字典启用时中文先交后台本机替换，绝不作为正文请求 API。@param {Object} unit 段落。@param {boolean} [checkNames] 是否存在有效人名字典。@returns {Object[]} 含节点位置与 dictionaryOnly 标记的片段。 */
+/** 为外文与本机字典构造有界任务；纯中文在本机处理，日语保留完整节点与来源。@param {Object} unit 段落。@param {boolean} [checkNames] 是否存在有效人名字典。@returns {Object[]} 含节点位置与来源的片段。 */
 export function createChunks(unit, checkNames = false) {
-  const chinese = isChineseText(unit.nodes.map((record) => record.original).join(""));
-  for (const record of unit.nodes) record.fragments = textFragments(record.original, chinese);
+  const text = unit.nodes.map((record) => record.original).join("");
+  const japanese = isJapaneseText(text);
+  const chinese = !japanese && isChineseText(text);
+  // 先判断完整段落，避免日文中单独加粗的汉字被当成中文跳过。
+  for (const record of unit.nodes)
+    record.fragments = textFragments(record.original, chinese, japanese);
   const context =
     splitText(
       unit.nodes
@@ -252,6 +258,7 @@ export function createChunks(unit, checkNames = false) {
       id: `${unit.id}:${chunks.length}`,
       parts,
       locations,
+      ...(japanese ? { sourceLanguage: "ja" } : {}),
       ...(dictionaryOnly ? { dictionaryOnly: true } : {}),
       ...(context ? { context } : {}),
       state: "pending",

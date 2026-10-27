@@ -1,6 +1,6 @@
 {
   "name": "yeyi-translator",
-  "version": "1.3.6",
+  "version": "1.3.8",
   "private": true,
   "type": "module",
   "description": "页译：支持 Chrome / Edge、DeepSeek / OpenAI 的整页翻译扩展",
@@ -11,7 +11,8 @@
     "format:check": "prettier --check src scripts tests manifest.json package.json README.md CHANGELOG.md",
     "test": "npm run test:regression && node tests/browser/run.mjs && node --test tests/browser/features.test.mjs && npm run test:shortcuts && npm run test:names && npm run test:settings",
     "test:settings": "node --test tests/browser/settings-upgrade.test.mjs",
-    "test:regression": "node --test tests/regression/api-connection.test.mjs tests/regression/inline-code.test.mjs tests/regression/translation-order.test.mjs tests/regression/batching.test.mjs tests/regression/chinese-skip.test.mjs tests/regression/cache.test.mjs tests/regression/cache-priority.test.mjs tests/regression/visibility.test.mjs tests/regression/scroll-stability.test.mjs tests/regression/translation-font.test.mjs tests/regression/dynamic-render.test.mjs tests/regression/reasoning.test.mjs",
+    "test:regression": "node --test tests/regression/api-connection.test.mjs tests/regression/inline-code.test.mjs tests/regression/translation-order.test.mjs tests/regression/batching.test.mjs tests/regression/chinese-skip.test.mjs tests/regression/cache.test.mjs tests/regression/cache-priority.test.mjs tests/regression/visibility.test.mjs tests/regression/scroll-stability.test.mjs tests/regression/translation-font.test.mjs tests/regression/dynamic-render.test.mjs tests/regression/reasoning.test.mjs tests/regression/japanese-translation.test.mjs",
+    "test:japanese": "node --test tests/regression/japanese-translation.test.mjs && node --test --test-name-pattern=日语专用 tests/browser/features.test.mjs",
     "test:reasoning": "node --test tests/regression/reasoning.test.mjs && node --test --test-name-pattern=推理级别 tests/browser/features.test.mjs",
     "test:scroll": "node --test tests/regression/scroll-stability.test.mjs",
     "test:browser": "node tests/browser/run.mjs",

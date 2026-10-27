@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { resolve, dirname, basename } from "node:path";
 import { chromium, expect } from "@playwright/test";
 import { startServer } from "./server.mjs";
+import { cacheKey, CACHE_PREFIX } from "../../src/background/cache.js";
 
 const output = resolve("test-results");
 const profile = resolve(output, `feature-profile-${Date.now()}`);
@@ -50,7 +51,7 @@ async function article(t, body = '<p id="source">Reusable source paragraph.</p>'
   });
   await page.route(`${fixture.url}/features/**`, (route) =>
     route.fulfill({
-      contentType: "text/html",
+      contentType: "text/html; charset=utf-8",
       body: `<!doctype html><html><body>${body}</body></html>`,
     }),
   );
@@ -636,17 +637,107 @@ test("网页内容脚本不能读取、清除、导出或导入持久缓存", as
   assert.equal(await page.locator("#source").textContent(), "Reusable source paragraph.");
 });
 
-test("关闭并重启浏览器后仍复用已保存译文", async (t) => {
+test("8344 条缓存跨天重启后复用日英译文，不等待新内容的慢请求", async (t) => {
   await settings({ cacheEnabled: true });
-  const page = await article(t);
-  await translate(page);
+  // 使用与问题现场相同的条数，在独立浏览器 profile 内构造约 2 MiB 的缓存。
+  const seeded = await message({
+    type: "IMPORT_CACHE",
+    data: {
+      format: "yeyi-translation-cache",
+      version: 1,
+      entries: Array.from({ length: 8304 }, (_, index) => ({
+        key: index.toString(16).padStart(64, "0"),
+        parts: ["仅用于缓存容量回归的模拟译文，不属于用户数据。"],
+      })),
+    },
+  });
+  assert.equal(seeded.ok, true);
+  const body = Array.from(
+    { length: 40 },
+    (_, index) =>
+      `<p class="cached" id="cached${index}">${index % 2 ? `Read this forum post ${index}.` : `これ<strong>最高</strong>じゃん、その${index}。`}</p>`,
+  ).join("");
+  const page = await article(t, body);
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator(".cached [data-yeyi-owned=translation]")).toHaveCount(40);
   const before = fixture.requests.length;
+  const saved = (await message({ type: "EXPORT_CACHE" })).data;
+  const savedSettings = (await message({ type: "GET_SETTINGS" })).data;
+  assert.equal(saved.entries.length, 8344);
+  const bytes = (await message({ type: "GET_CACHE_STATS" })).data.bytes;
   await context.close();
   await launch();
-  const restarted = await article(t);
-  await translate(restarted);
-  assert.equal(fixture.requests.length, before);
-  assert.equal((await message({ type: "GET_CACHE_STATS" })).data.count, 1);
+  // 只推进测试 worker 的日期，证明身份与保存时间无关；不修改用户电脑时钟。
+  await worker.evaluate(() => {
+    const now = Date.now;
+    Date.now = () => now() + 2 * 24 * 60 * 60 * 1000;
+  });
+  fixture.state.delayMs = 8000;
+  t.after(() => {
+    fixture.state.delayMs = 0;
+  });
+  const restarted = await article(t, `<p id="slow">New uncached forum post.</p>${body}`);
+  const started = performance.now();
+  await restarted.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(restarted.locator(".cached [data-yeyi-owned=translation]")).toHaveCount(40);
+  const elapsedMs = Math.round(performance.now() - started);
+  await expect.poll(() => fixture.requests.length).toBe(before + 1);
+  assert.deepEqual(
+    fixture.requests
+      .slice(before)
+      .flatMap((request) =>
+        JSON.parse(request.body.messages.at(-1).content).segments.flatMap(
+          (segment) => segment.parts,
+        ),
+      ),
+    ["New uncached forum post."],
+  );
+  await expect(restarted.locator("#slow [data-yeyi-owned=translation]")).toHaveCount(0);
+  assert.deepEqual((await message({ type: "EXPORT_CACHE" })).data, saved);
+  assert.deepEqual((await message({ type: "GET_SETTINGS" })).data, savedSettings);
+  t.diagnostic(`8344 条 / ${bytes} 字节；重启后 40 段缓存显示耗时 ${elapsedMs} ms，缓存零重译。`);
+});
+
+test("异常缓存只重译一次，实际磁盘修复后刷新和重启仍可复用", async (t) => {
+  await settings({ cacheEnabled: true });
+  const config = (await message({ type: "GET_PUBLIC_CONFIG" })).data;
+  const sources = ["Missing cached forum post.", "Invalid cached forum post.", "これ最高だね。"];
+  const keys = await Promise.all(
+    sources.map(
+      async (text) => CACHE_PREFIX + (await cacheKey(config.signature, { parts: [text] })),
+    ),
+  );
+  await worker.evaluate(
+    (keys) =>
+      chrome.storage.local.set({
+        translationCacheIndexV1: keys,
+        [keys[1]]: "损坏的正文",
+        [keys[2]]: ["分片数量", "不符合原文"],
+      }),
+    keys,
+  );
+  const savedSettings = (await message({ type: "GET_SETTINGS" })).data;
+  const body = sources.map((text) => `<p class="repair">${text}</p>`).join("");
+  const before = fixture.requests.length;
+  const page = await article(t, body);
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator(".repair [data-yeyi-owned=translation]")).toHaveCount(3);
+  assert.equal(fixture.requests.length, before + 1);
+  const repaired = (await message({ type: "EXPORT_CACHE" })).data;
+  assert.equal(repaired.entries.length, 3);
+  assert(repaired.entries.every((entry) => entry.parts.length === 1));
+  await page.reload();
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator(".repair [data-yeyi-owned=translation]")).toHaveCount(3);
+  assert.equal(fixture.requests.length, before + 1);
+  await context.close();
+  await launch();
+  const restarted = await article(t, body);
+  await restarted.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(restarted.locator(".repair [data-yeyi-owned=translation]")).toHaveCount(3);
+  assert.equal(fixture.requests.length, before + 1);
+  assert.deepEqual((await message({ type: "EXPORT_CACHE" })).data, repaired);
+  assert.deepEqual((await message({ type: "GET_SETTINGS" })).data, savedSettings);
 });
 
 test("可视区域模式推迟屏幕外同源和跨域 iframe，滚动出现后开始翻译", async (t) => {
@@ -832,6 +923,63 @@ test("中文字体优化兼容汉字人名字典，本机命中与站点重绘�
   });
   await expect(page.locator("#source")).toHaveText("测试名");
   assert.equal(fixture.requests.length, requests);
+});
+
+test("日语专用提示词按原文启用，混排、内联汉字、还原及重载缓存保持完整", async (t) => {
+  await settings({ mode: "replace", cacheEnabled: true });
+  const original =
+    '<main lang="ja"><p id="source">これ<strong id="kanji">最高</strong><a id="link" href="/keep">じゃん。</a></p><p id="halfwidth">ﾜﾛﾀｗ</p><p id="english">Welcome to the open web</p><p id="chinese">这是中文帖子。</p></main>';
+  const page = await article(t, original);
+  const before = fixture.requests.length;
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#kanji")).toHaveText("译文：最高");
+  await expect(page.locator("#halfwidth")).toHaveText("译文：ﾜﾛﾀｗ");
+  await expect(page.locator("#english")).toHaveText("欢迎来到开放网络");
+  await expect(page.locator("#chinese")).toHaveText("这是中文帖子。");
+  await expect(page.locator("#link")).toHaveAttribute("href", "/keep");
+  const sent = fixture.requests.slice(before);
+  assert.equal(sent.length, 1);
+  const input = JSON.parse(sent[0].body.messages.at(-1).content);
+  assert.deepEqual(
+    input.segments
+      .filter((segment) => input.japaneseSegmentIds.includes(segment.id))
+      .map((segment) => segment.parts.join("")),
+    ["これ最高じゃん。", "ﾜﾛﾀｗ"],
+  );
+  assert.equal(
+    input.segments.find((segment) => segment.parts.includes("最高")).sourceLanguage,
+    "ja",
+  );
+  assert.equal(
+    input.segments.find((segment) => segment.parts[0] === "Welcome to the open web").sourceLanguage,
+    undefined,
+  );
+  assert.match(sent[0].body.messages[0].content, /Japanese forum translation/);
+  await expect.poll(async () => (await message({ type: "GET_CACHE_STATS" })).data.count).toBe(3);
+  await page.getByRole("button", { name: "恢复原文", exact: true }).click();
+  await expect(page.locator("#source")).toHaveText("これ最高じゃん。");
+  await expect(page.locator("#kanji")).toHaveText("最高");
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#kanji")).toHaveText("译文：最高");
+  assert.equal(fixture.requests.length, before + 1);
+  await page.reload();
+  await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+  await expect(page.locator("#kanji")).toHaveText("译文：最高");
+  await expect(page.locator("#english")).toHaveText("欢迎来到开放网络");
+  assert.equal(fixture.requests.length, before + 1);
+  // 即使页面标为 ja，新出现的英文仍使用通用提示词。
+  await page.locator("main").evaluate((element) => {
+    const paragraph = document.createElement("p");
+    paragraph.id = "dynamicEnglish";
+    paragraph.textContent = "Read the guide and explore.";
+    element.append(paragraph);
+  });
+  await expect(page.locator("#dynamicEnglish")).toHaveText("阅读指南并探索。");
+  assert.equal(fixture.requests.length, before + 2);
+  assert.doesNotMatch(
+    fixture.requests.at(-1).body.messages[0].content,
+    /Japanese forum translation/,
+  );
 });
 
 for (const cacheEnabled of [false, true]) {

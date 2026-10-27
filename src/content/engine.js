@@ -3,6 +3,7 @@ import { sendMessage } from "../shared/messaging.js";
 import { visibleTranslationScope } from "./visibility.js";
 import { translationFont, TranslationFontStyles } from "./translation-font.js";
 import { TranslationScrollAnchor } from "./scroll-anchor.js";
+import { translationProfile } from "../shared/translation-profile.js";
 
 const BATCH_MAX_SEGMENTS = 18;
 const BATCH_MAX_CHARS = 4800;
@@ -20,6 +21,7 @@ function segmentsOf(tasks) {
   return tasks.map(({ chunk }) => ({
     id: chunk.id,
     parts: chunk.parts,
+    ...(chunk.sourceLanguage ? { sourceLanguage: chunk.sourceLanguage } : {}),
     ...(chunk.dictionaryOnly ? { dictionaryOnly: true } : {}),
     ...(chunk.context ? { context: chunk.context } : {}),
   }));
@@ -385,9 +387,10 @@ export class TranslationEngine {
     });
   }
 
-  /** 缓存键包含服务、模型、目标语言及完整节点原文。@param {Object} unit 段落。@returns {string} 内存键。 */
+  /** 按专用提示词版本隔离日语内存缓存，普通段落继续使用原身份。 */
   cacheKey(unit) {
-    return `${this.config.signature}\n${JSON.stringify(unit.nodes.map((record) => record.original))}`;
+    const profile = unit.chunks.map((chunk) => translationProfile(chunk)).find(Boolean);
+    return `${this.config.signature}\n${JSON.stringify(unit.nodes.map((record) => record.original))}${profile ? `\n${profile}` : ""}`;
   }
 
   /** 保存有限缓存，避免无限滚动页面持续占用内存。@param {Object} unit 完成的段落。@returns {void} 无返回值。 */
