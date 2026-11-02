@@ -823,6 +823,79 @@ test("命中缓存立即显示，同页慢请求只包含未缓存文字", async
   await expect(page.locator("#missing [data-yeyi-owned=translation]")).toHaveCount(0);
 });
 
+for (const mode of ["replace", "bilingual"]) {
+  test(`历史消息缓存独立于正在翻译的 HTTP 批次，滚动停稳直接显示 30 条（${mode}）`, async (t) => {
+    await settings({ cacheEnabled: true, visibleOnly: false, mode });
+    const config = (await message({ type: "GET_PUBLIC_CONFIG" })).data;
+    const history = Array.from({ length: 30 }, (_, index) => `Cached browser history ${index}.`);
+    const entries = await Promise.all(
+      history.map(async (text) => ({
+        key: await cacheKey(config.signature, { parts: [text] }),
+        parts: [`历史缓存：${text}`],
+      })),
+    );
+    assert.equal(
+      (
+        await message({
+          type: "IMPORT_CACHE",
+          data: { format: "yeyi-translation-cache", version: 1, entries },
+        })
+      ).ok,
+      true,
+    );
+    const stored = (await message({ type: "EXPORT_CACHE" })).data;
+    const page = await article(
+      t,
+      `<style>#chat{height:240px;width:500px;overflow:auto}p{min-height:30px;margin:0}</style><div id="chat"><div data-list-id="chat-messages">${Array.from({ length: 10 }, (_, index) => `<p class="fresh">Fresh slow browser source ${index}.</p>`).join("")}</div></div>`,
+    );
+    fixture.state.delayMs = 8000;
+    t.after(() => {
+      fixture.state.delayMs = 0;
+    });
+    const before = fixture.requests.length;
+    await page.getByRole("button", { name: "打开翻译设置" }).click();
+    await page.getByRole("button", { name: "翻译此页", exact: true }).click();
+    await expect.poll(() => fixture.requests.length).toBe(before + 1);
+    const started = Date.now();
+    await page.evaluate(async (history) => {
+      const chat = document.querySelector("#chat");
+      document
+        .querySelector("[data-list-id]")
+        .insertAdjacentHTML(
+          "afterbegin",
+          history.map((text) => `<p class="history">${text}</p>`).join(""),
+        );
+      // 模拟历史消息加载后的连续上滚；不让测试的网络响应推进缓存显示。
+      for (let index = 0; index < 6; index++) {
+        chat.dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+    }, history);
+    await expect(page.locator(".history").filter({ hasText: "历史缓存" })).toHaveCount(30, {
+      timeout: 2500,
+    });
+    await expect(page.locator(".source-status")).toHaveText("缓存命中 30 段 · 新翻译 0 段");
+    await expect(page.locator(".status")).toContainText("30 / 40 段已完成");
+    assert.equal(await page.locator(".fresh").filter({ hasText: "译文：" }).count(), 0);
+    assert.deepEqual(
+      fixture.requests
+        .slice(before)
+        .flatMap((request) =>
+          JSON.parse(request.body.messages.at(-1).content).segments.flatMap(
+            (segment) => segment.parts,
+          ),
+        ),
+      Array.from({ length: 10 }, (_, index) => `Fresh slow browser source ${index}.`),
+    );
+    assert.deepEqual((await message({ type: "EXPORT_CACHE" })).data, stored);
+    t.diagnostic(
+      `10 条 HTTP 译文尚未返回，新增 30 条历史缓存含连续滚动在 ${Date.now() - started} ms 内显示。`,
+    );
+    await page.getByRole("button", { name: "恢复原文", exact: true }).click();
+    assert.deepEqual(await page.locator(".history").allTextContents(), history);
+  });
+}
+
 test("中文字体开关默认关闭，保存和重启设置页保持，Key、缓存及人名字典均保留", async () => {
   await expect(options.locator('[name="optimizeChineseFont"]')).not.toBeChecked();
   const saved = (await message({ type: "GET_SETTINGS" })).data;

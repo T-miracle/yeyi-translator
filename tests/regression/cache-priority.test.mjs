@@ -19,7 +19,11 @@ before(async () => {
 after(async () => browser?.close());
 
 /** 缓存查询独立控制，网络请求始终挂起，直接验证命中显示不依赖任何 API 响应。 */
-async function startPage(t, html, { deferLookup = false, cacheEnabled = true } = {}) {
+async function startPage(
+  t,
+  html,
+  { deferLookup = false, cacheEnabled = true, mode = "bilingual" } = {},
+) {
   const page = await browser.newPage();
   t.after(() => page.close());
   await page.route("http://127.0.0.1/", (route) =>
@@ -31,7 +35,7 @@ async function startPage(t, html, { deferLookup = false, cacheEnabled = true } =
   await page.goto("http://127.0.0.1/");
   await page.addScriptTag({ content: source });
   await page.evaluate(
-    ({ deferLookup, cacheEnabled }) => {
+    ({ deferLookup, cacheEnabled, mode }) => {
       globalThis.lookups = [];
       globalThis.requests = [];
       globalThis.chrome = {
@@ -59,11 +63,11 @@ async function startPage(t, html, { deferLookup = false, cacheEnabled = true } =
       engine.start({
         signature: "cache-priority",
         targetLanguage: "zh-CN",
-        mode: "bilingual",
+        mode,
         cacheEnabled,
       });
     },
-    { deferLookup, cacheEnabled },
+    { deferLookup, cacheEnabled, mode },
   );
   return page;
 }
@@ -119,6 +123,148 @@ test("网络批次未结束时，新出现的缓存命中仍可独立显示", as
     "缓存译文：Cached dynamic source.",
   );
   assert.deepEqual(await requestTexts(page), ["Uncached slow source."]);
+});
+
+for (const mode of ["replace", "bilingual"]) {
+  test(`滚动历史消息时先查新增 30 条缓存，不等待正在翻译的 10 条（${mode}）`, async (t) => {
+    const page = await startPage(
+      t,
+      `<style>#chat{height:240px;overflow:auto}p{height:30px;margin:0}</style><div id="chat"><div data-list-id="chat-messages">${Array.from({ length: 10 }, (_, index) => `<p class="fresh">Uncached slow source ${index}.</p>`).join("")}</div></div>`,
+      { mode },
+    );
+    await expect.poll(() => page.evaluate(() => requests.length)).toBe(1);
+    assert.equal((await requestTexts(page)).length, 10);
+    await page.clock.install();
+    await page.clock.pauseAt(new Date());
+    await page.evaluate(() => {
+      const chat = document.querySelector("#chat");
+      chat.dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
+      document
+        .querySelector("[data-list-id]")
+        .insertAdjacentHTML(
+          "afterbegin",
+          Array.from(
+            { length: 30 },
+            (_, index) => `<p class="history">Cached historical source ${index}.</p>`,
+          ).join(""),
+        );
+    });
+    // 缓存预检应在滚动的 180 ms 静止窗口结束前触发，不由网络请求完成驱动。
+    await page.clock.runFor(100);
+    const checked = await page.evaluate(() =>
+      lookups.flatMap(({ message }) => message.segments.flatMap((segment) => segment.parts)),
+    );
+    assert.equal(checked.filter((text) => text.startsWith("Cached historical")).length, 30);
+    assert.equal(await page.locator(".history").filter({ hasText: "缓存译文" }).count(), 0);
+    await page.clock.runFor(250);
+    await expect(page.locator(".history").filter({ hasText: "缓存译文" })).toHaveCount(30);
+    assert.equal(await page.evaluate(() => requests.length), 1);
+    assert.equal(await page.evaluate(() => engine.workers), 1);
+    assert.deepEqual(await sourceCounts(page), { done: 30, cached: 30, translated: 0, skipped: 0 });
+    await page.evaluate(() => engine.restore());
+    assert.equal(await page.locator(".history").filter({ hasText: "缓存译文" }).count(), 0);
+  });
+}
+
+test("滚动中复用消息节点只预检新原文，旧译文不提前撤回，迟到命中不能覆盖新消息", async (t) => {
+  const page = await startPage(
+    t,
+    '<style>#chat{height:100px;overflow:auto}p{height:80px}</style><div id="chat"><div data-list-id="chat-messages"><p id="recycled"><span>Cached original.</span><b>Cached suffix.</b></p><p>Uncached slow source.</p></div></div>',
+    { mode: "replace", deferLookup: true },
+  );
+  await releaseLookup(page, 0);
+  await expect(page.locator("#recycled span")).toHaveText("缓存译文：Cached original.");
+  await expect.poll(() => page.evaluate(() => requests.length)).toBe(1);
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  await page.evaluate(() => {
+    document
+      .querySelector("#chat")
+      .dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
+    document.querySelector("#recycled span").firstChild.data = "Cached replacement.";
+    engine.scan();
+  });
+  assert.equal(await page.evaluate(() => lookups.length), 2);
+  await expect(page.locator("#recycled b")).toHaveText("缓存译文：Cached suffix.");
+  await page.evaluate(() => {
+    document.querySelector("#recycled span").firstChild.data = "Cached newest.";
+    engine.scan();
+  });
+  await releaseLookup(page, 1);
+  await releaseLookup(page, 2);
+  await expect(page.locator("#recycled span")).toHaveText("Cached newest.");
+  await expect(page.locator("#recycled b")).toHaveText("缓存译文：Cached suffix.");
+  await page.clock.runFor(300);
+  await expect(page.locator("#recycled span")).toHaveText("缓存译文：Cached newest.");
+  assert.equal(await page.evaluate(() => lookups.length), 3);
+  assert.deepEqual(await requestTexts(page), ["Uncached slow source."]);
+  await page.evaluate(() => engine.restore());
+  await expect(page.locator("#recycled")).toHaveText("Cached newest.Cached suffix.");
+});
+
+for (const action of ["restore", "clearCache"]) {
+  test(`滚动预检期间 ${action} 后丢弃旧命中，不把迟到译文带回页面`, async (t) => {
+    const page = await startPage(
+      t,
+      '<style>#chat{height:100px;overflow:auto}p{height:80px}</style><div id="chat"><div data-list-id="chat-messages"><p>这是中文原文。</p><p>这也是中文原文。</p></div></div>',
+      { deferLookup: true },
+    );
+    await page.clock.install();
+    await page.clock.pauseAt(new Date());
+    await page.evaluate(() => {
+      document
+        .querySelector("#chat")
+        .dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
+      document
+        .querySelector("[data-list-id]")
+        .insertAdjacentHTML("afterbegin", '<p id="history">Cached history.</p>');
+    });
+    await page.clock.runFor(100);
+    assert.equal(await page.evaluate(() => lookups.length), 1);
+    await page.evaluate((action) => engine[action](), action);
+    await releaseLookup(page, 0);
+    await page.clock.runFor(300);
+    await expect(page.locator("#history")).toHaveText("Cached history.");
+    assert.equal(await page.evaluate(() => engine.cache.size), 0);
+    assert.equal(await page.evaluate(() => requests.length), 0);
+    if (action === "clearCache") {
+      assert.equal(await page.evaluate(() => lookups.length), 2);
+      await page.evaluate(() => lookups[1].resolve({ ok: true, data: [] }));
+      await page.clock.runFor(200);
+      assert.deepEqual(await requestTexts(page), ["Cached history."]);
+    }
+  });
+}
+
+test("滚动预检未结束就停稳时复用原查询，命中先显示、缺项单独入队", async (t) => {
+  const page = await startPage(
+    t,
+    '<style>#chat{height:100px;overflow:auto}p{height:80px}</style><div id="chat"><div data-list-id="chat-messages"><p>这是中文原文。</p><p>这也是中文原文。</p></div></div>',
+    { deferLookup: true },
+  );
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  await page.evaluate(() => {
+    document
+      .querySelector("#chat")
+      .dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
+    document
+      .querySelector("[data-list-id]")
+      .insertAdjacentHTML(
+        "afterbegin",
+        '<p id="history">Cached history.</p><p>Uncached history.</p>',
+      );
+  });
+  await page.clock.runFor(400);
+  assert.equal(await page.evaluate(() => lookups.length), 1);
+  assert.equal(await page.evaluate(() => requests.length), 0);
+  await releaseLookup(page, 0);
+  await expect(page.locator("#history [data-yeyi-owned=translation]")).toHaveText(
+    "缓存译文：Cached history.",
+  );
+  await page.clock.runFor(200);
+  assert.deepEqual(await requestTexts(page), ["Uncached history."]);
+  assert.equal(await page.evaluate(() => lookups.length), 1);
 });
 
 test("恢复并重启后忽略旧缓存查询，未完成查询不会进入翻译队列", async (t) => {

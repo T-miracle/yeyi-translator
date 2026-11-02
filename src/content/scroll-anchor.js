@@ -68,7 +68,7 @@ export class TranslationScrollAnchor {
     this.pending = false;
   }
 
-  /** 网络及缓存结果仍可完成，扫描和排版统一等到实际滚动停稳。 */
+  /** 仅推迟排版和网络派发；滚动期间仍扫描原文并预检缓存，停稳后核对并显示。 */
   wait() {
     if (!this.moving.size) return false;
     this.pending = true;
