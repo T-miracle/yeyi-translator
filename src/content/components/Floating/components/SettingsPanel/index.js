@@ -1,5 +1,9 @@
 import { LANGUAGES } from "../../../../../shared/settings.js";
 import { populateLanguages } from "../../../../../shared/messaging.js";
+import {
+  translationSourcesText,
+  TRANSLATION_SOURCES_HINT,
+} from "../../../../../shared/translation-progress.js";
 
 /** 常用设置面板，拥有表单保存及错误展示的生命周期。 */
 export class SettingsPanel {
@@ -31,6 +35,7 @@ export class SettingsPanel {
       .modes{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin:14px 0;padding:3px;background:#f3f1f8;border-radius:9px}.modes button{border:0;border-radius:6px;padding:7px 0;background:transparent;color:#797088}.modes button[aria-pressed=true]{background:#fff;color:#5e48ce;box-shadow:0 1px 4px #36244e10}
       .auto-row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;color:#6e667c;cursor:pointer}.auto-row input{accent-color:#6350df;width:15px;height:15px;cursor:pointer}
       .status{margin:14px 0 0;padding-top:12px;border-top:1px solid #f0edf5;color:#948b9e;font-size:11px;line-height:1.65;overflow-wrap:anywhere}.status.error{color:#a56928}
+      .source-status{margin-top:5px;color:#716583;font-size:11px;line-height:1.65;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.source-status[hidden]{display:none}
       .auxiliary{display:flex;gap:8px;margin-top:10px}.auxiliary button{flex:1;padding:6px 8px;border:1px solid #e8e3f0;border-radius:7px;background:#fff;color:#716583}.auxiliary button[hidden]{display:none}
       .all-settings{display:block;width:100%;margin-top:10px;padding:4px 0;border:0;background:transparent;color:#8a7f9b;font-size:11px;text-align:center}
     </style><div class="panel-head"><span class="panel-title">翻译设置</span><button type="button" class="panel-close" aria-label="关闭翻译设置">×</button></div>
@@ -39,9 +44,11 @@ export class SettingsPanel {
       <div class="modes"><button type="button" data-mode="bilingual" aria-pressed="true">原文 / 译文</button><button type="button" data-mode="replace" aria-pressed="false">替换原文</button></div>
       <label class="auto-row">本站自动翻译<input type="checkbox" name="autoSite" aria-label="本站自动翻译" /></label>
       <div class="status" role="status">点击翻译，开始阅读。</div>
+      <div class="source-status" aria-label="译文来源统计" hidden></div>
       <div class="auxiliary"><button type="button" data-action="toggle-pause" hidden>暂停翻译</button><button type="button" data-action="retry" hidden>重试失败部分</button></div>
       <button type="button" class="all-settings">完整设置 ↗</button>`;
     populateLanguages(this.element.querySelector('[name="targetLanguage"]'), LANGUAGES);
+    this.element.querySelector(".source-status").title = TRANSLATION_SOURCES_HINT;
     this.element.querySelector(".panel-close").addEventListener("click", onClose);
     this.element
       .querySelector(".all-settings")
@@ -119,6 +126,9 @@ export class SettingsPanel {
         ? "点击翻译，开始阅读。"
         : `${state.done} / ${state.total} 段已完成${state.retrying ? ` · ${state.retrying} 段等待重试（最多 3 次）` : state.failed ? ` · ${state.failed} 段失败，可重试` : state.phase === "watching" ? " · 已完成" : state.phase === "paused" ? " · 已暂停" : " · 正在翻译"}`);
     status.classList.toggle("error", Boolean(state.error || state.failed));
+    const sources = this.element.querySelector(".source-status");
+    sources.textContent = translationSourcesText(state);
+    sources.hidden = !state.total && !state.active;
     const pause = this.element.querySelector('[data-action="toggle-pause"]');
     pause.hidden = !state.total || state.phase === "error";
     pause.textContent = state.active ? "暂停翻译" : "继续翻译";

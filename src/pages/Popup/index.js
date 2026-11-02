@@ -1,5 +1,9 @@
 import { LANGUAGES, isTranslatableUrl } from "../../shared/settings.js";
 import { sendMessage, populateLanguages } from "../../shared/messaging.js";
+import {
+  translationSourcesText,
+  TRANSLATION_SOURCES_HINT,
+} from "../../shared/translation-progress.js";
 
 const elements = Object.fromEntries(
   [...document.querySelectorAll("[id]")].map((element) => [element.id, element]),
@@ -11,6 +15,7 @@ let hostname = "";
 let busy = false;
 let pollTimer;
 populateLanguages(elements.targetLanguage, LANGUAGES);
+elements.progressSources.title = TRANSLATION_SOURCES_HINT;
 
 /** 在 popup 中显示操作或配置提示。@param {string} message 提示。@param {boolean} [error] 是否错误。@returns {void} 无返回值。 */
 function notice(message, error = false) {
@@ -66,6 +71,7 @@ function render() {
     elements.progressLabel.textContent = labels[phase];
     elements.progress.max = Math.max(1, state.total);
     elements.progress.value = state.done;
+    elements.progressSources.textContent = translationSourcesText(state);
     elements.progressDetail.textContent = state.retrying
       ? `${state.retrying} 段等待重试（最多 3 次），其他内容优先翻译`
       : state.failed

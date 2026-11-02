@@ -316,6 +316,14 @@ progress::-webkit-progress-value {
   background: #8b79df;
   border-radius: 5px;
 }
+.progress-sources {
+  margin-bottom: 6px;
+  color: #716583;
+  font-size: 11px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
 .progress-detail {
   display: flex;
   justify-content: space-between;

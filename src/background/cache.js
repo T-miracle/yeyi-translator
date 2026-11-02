@@ -194,6 +194,7 @@ export async function lookupCachedTranslations({ cache, settings, segments }) {
 /**
  * 验证请求后只把未命中的片段发往 API，再按本次 ID 还原完整响应。
  * 同批相同原文合并为一次请求；仅持久化 API 已校验成功的结果。
+ * 返回本次结果是否来自缓存，覆盖预检后由其他页面写入的命中；来源标记不写入存档。
  * 缓存故障只提示，不把已成功的翻译误报为失败。
  */
 export async function translateWithCache({
@@ -215,7 +216,8 @@ export async function translateWithCache({
     deferRetries: true,
     retryFragments,
   };
-  if (!settings.cacheEnabled) return translate(request);
+  if (!settings.cacheEnabled)
+    return (await translate(request)).map((item) => ({ ...item, cacheHit: false }));
   const revision = cache.revision;
   const { keys, hits } = await matchingCache(cache, settings, segments);
   const missing = new Map();
@@ -236,5 +238,9 @@ export async function translateWithCache({
       }
     }
   }
-  return segments.map((segment, index) => ({ id: segment.id, parts: hits.get(keys[index]) }));
+  return segments.map((segment, index) => ({
+    id: segment.id,
+    parts: hits.get(keys[index]),
+    cacheHit: !missing.has(keys[index]),
+  }));
 }

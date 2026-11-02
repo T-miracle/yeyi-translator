@@ -27,6 +27,19 @@ function segmentsOf(tasks) {
   }));
 }
 
+/** 同时核对节点身份和原文，虚拟列表复用容器时不能沿用上一条消息。 */
+function matchesRecords(unit, records) {
+  return Boolean(
+    unit &&
+    records &&
+    records.length === unit.nodes.length &&
+    records.every(
+      (record, index) =>
+        record.node === unit.nodes[index].node && record.original === unit.nodes[index].original,
+    ),
+  );
+}
+
 /**
  * 单个 frame 的整页翻译会话。原文、译文与缓存均只存在此页面的内存中。
  * @property {Map<Element,Object>} units 段落记录；通过实际 DOM 节点识别网站重渲染。
@@ -40,6 +53,8 @@ export class TranslationEngine {
     this.onChange = onChange;
     /** @type {Map<Element,Object>} 仍可能需要恢复的段落。 */
     this.units = new Map();
+    /** @type {Map<Element,Object>} 滚动中只读预检的段落，停稳核对后才接管节点和显示译文。 */
+    this.pendingUnits = new Map();
     /** @type {Map<Element,number>|null} 视口及上下预翻译窗口；0 为当前可视内容。 */
     this.scope = null;
     /** @type {WeakMap<Text,Object>} 节点原文与最后一次自有写入。 */
@@ -94,7 +109,8 @@ export class TranslationEngine {
         this.scheduleScan();
     });
     /** @type {Function} 捕获内部滚动容器的事件，视口模式更快扫描新露出的文字。 */
-    this.onViewportChange = () => this.scheduleScan(this.config?.visibleOnly ? 60 : 400);
+    this.onViewportChange = () =>
+      this.scheduleScan(this.config?.visibleOnly || this.config?.cacheEnabled ? 60 : 400);
     /** @type {boolean} 子帧必须先确认外层页面中实际有交集。 */
     this.frameVisible = window === window.top;
     /** @type {IntersectionObserver|null} 浏览器负责跨域 iframe 的外层裁剪和滚动通知。 */
@@ -111,14 +127,26 @@ export class TranslationEngine {
           });
   }
 
-  /** 返回可展示的进度，永远不包括原文和密钥。@returns {Object} 本 frame 状态。 */
+  /**
+   * 按当前仍在页面中的已完成段落统计来源，扫描、暂停或重试不会累计重复次数。
+   * 整段全部复用才算缓存；部分分片新译的段落只计一次新翻译，零任务段落单列为无需翻译。
+   * @returns {Object} 不包含原文和密钥的本 frame 状态。
+   */
   getState() {
     const units = [...this.units.values()].filter((unit) => unit.element.isConnected);
+    const completed = units.filter((unit) => unit.chunks.every((chunk) => chunk.state === "done"));
+    const skipped = completed.filter((unit) => !unit.chunks.length).length;
+    const cached = completed.filter(
+      (unit) => unit.chunks.length && unit.chunks.every((chunk) => chunk.cacheHit),
+    ).length;
     return {
       phase: this.phase,
       active: this.active,
       total: units.length,
-      done: units.filter((unit) => unit.chunks.every((chunk) => chunk.state === "done")).length,
+      done: completed.length,
+      cached,
+      translated: completed.length - cached - skipped,
+      skipped,
       failed: units.filter((unit) => unit.chunks.some((chunk) => chunk.state === "failed")).length,
       retrying: units.filter((unit) =>
         unit.chunks.some(
@@ -186,7 +214,7 @@ export class TranslationEngine {
   }
 
   /** 把频繁的 DOM 更新合并到一次扫描。@returns {void} 无返回值。 */
-  scheduleScan(delay = 400) {
+  scheduleScan(delay = this.config?.cacheEnabled ? 60 : 400) {
     if (this.scanTimer || !this.active) return;
     this.scanTimer = setTimeout(() => {
       this.scanTimer = null;
@@ -202,6 +230,7 @@ export class TranslationEngine {
     this.cacheRevision++;
     this.dispatchToken = null;
     this.cacheLookups = new Set();
+    this.pendingUnits.clear();
     this.cache.clear();
     this.cacheChars = 0;
     for (const unit of this.units.values())
@@ -216,6 +245,11 @@ export class TranslationEngine {
       (this.scope?.get(first.element) || 0) - (this.scope?.get(second.element) || 0) ||
       compareDocumentOrder(first.element, second.element)
     );
+  }
+
+  /** 缓存预检可以属于已接管的段落，也可以属于滚动中尚未接管的当前原文。 */
+  ownsUnit(unit) {
+    return this.units.get(unit.element) === unit || this.pendingUnits.get(unit.element) === unit;
   }
 
   /**
@@ -248,17 +282,18 @@ export class TranslationEngine {
         const hits = new Map(cached.map((item) => [item.id, item.parts]));
         this.mutate(() => {
           for (const { unit, chunk } of batch) {
-            if (this.units.get(unit.element) !== unit || chunk.state !== "checking") continue;
+            if (!this.ownsUnit(unit) || chunk.state !== "checking") continue;
             const parts = hits.get(chunk.id);
             if (!parts) {
               chunk.state = "pending";
               continue;
             }
             chunk.translated = parts;
+            chunk.cacheHit = true;
             chunk.state = "done";
             if (unit.chunks.every((item) => item.state === "done")) {
               this.remember(unit);
-              this.renderUnit(unit);
+              if (this.units.get(unit.element) === unit) this.renderUnit(unit);
             }
           }
         });
@@ -276,8 +311,7 @@ export class TranslationEngine {
       }
       // 查询异常只回退到正常翻译，不覆盖或删除持久缓存。
       for (const { unit, chunk } of tasks)
-        if (this.units.get(unit.element) === unit && chunk.state === "checking")
-          chunk.state = "pending";
+        if (this.ownsUnit(unit) && chunk.state === "checking") chunk.state = "pending";
     } finally {
       if (current()) this.pump();
     }
@@ -409,32 +443,56 @@ export class TranslationEngine {
     }
   }
 
-  /** 重新协调可见 DOM 和记录；失效段落的迟到结果会被忽略。@returns {Promise<void>|undefined} 本次缓存预检完成，可在合批发送前等待新增缺项入队。 */
+  /** 只按原文准备段落并复用本页缓存，不接管节点、不改动网页排版。 */
+  prepareUnit(element, records) {
+    const unit = {
+      id: `u${++this.sequence}`,
+      element,
+      anchor: null,
+      nodes: records.map((record) => ({ ...record, lastWritten: record.original })),
+      chunks: [],
+    };
+    unit.chunks = createChunks(unit, Boolean(this.config.nameDictionarySignature));
+    const cached = this.cache.get(this.cacheKey(unit));
+    if (cached && cached.value.length === unit.chunks.length) {
+      unit.chunks.forEach((chunk, index) => {
+        chunk.translated = cached.value[index];
+        chunk.cacheHit = true;
+        chunk.state = "done";
+      });
+    } else if (this.config.cacheEnabled) {
+      for (const chunk of unit.chunks) chunk.state = "unchecked";
+    }
+    return unit;
+  }
+
+  /**
+   * 扫描和缓存读取始终独立于网络 worker；滚动中仅暂存新原文与预检结果，不恢复或替换 DOM。
+   * 停稳后重新核对节点身份，接入仍然有效的预检段落，缓存命中直接显示，只有缺项进入翻译队列。
+   * @returns {Promise<void>|undefined} 本次缓存预检完成，可在合批发送前等待新增缺项入队。
+   */
   scan() {
-    if (this.scrollAnchor.wait()) return;
     if (this.config.visibleOnly && !this.frameVisible) return;
+    const moving = this.scrollAnchor.wait();
     const groups = collectGroups(document, this.ownership);
     this.scope = this.config.visibleOnly ? visibleTranslationScope(groups) : null;
-    this.mutate(() => {
-      for (const [element, unit] of this.units) {
-        const nodes = groups.get(element);
-        const unchanged =
-          nodes &&
-          nodes.length === unit.nodes.length &&
-          nodes.every(
-            (record, index) =>
-              record.node === unit.nodes[index].node &&
-              record.original === unit.nodes[index].original,
-          );
-        if (!unchanged) {
-          this.restoreUnit(unit);
-          this.units.delete(element);
+    for (const [element, unit] of this.pendingUnits) {
+      if (!matchesRecords(unit, groups.get(element)) || (this.scope && !this.scope.has(element)))
+        this.pendingUnits.delete(element);
+    }
+    const reconcile = () => {
+      if (!moving) {
+        for (const [element, unit] of this.units) {
+          if (!matchesRecords(unit, groups.get(element))) {
+            this.restoreUnit(unit);
+            this.units.delete(element);
+          }
         }
       }
       for (const [element, records] of groups) {
-        if (this.units.has(element)) {
+        if (matchesRecords(this.units.get(element), records)) {
           const unit = this.units.get(element);
-          if (unit.chunks.every((chunk) => chunk.state === "done")) {
+          if (!moving && unit.chunks.every((chunk) => chunk.state === "done")) {
             // X 等动态站点可能在同一文本节点写回相同原文。保留已完成状态，但重新显示已有译文。
             const overwritten =
               this.config.mode === "replace" &&
@@ -446,31 +504,22 @@ export class TranslationEngine {
           }
           continue;
         }
-        const unit = {
-          id: `u${++this.sequence}`,
-          element,
-          anchor: null,
-          nodes: records.map((record) => ({ ...record, lastWritten: record.original })),
-          chunks: [],
-        };
         if (this.scope && !this.scope.has(element)) continue;
-        unit.chunks = createChunks(unit, Boolean(this.config.nameDictionarySignature));
-        unit.nodes.forEach((record) => this.ownership.set(record.node, record));
-        const cached = this.cache.get(this.cacheKey(unit));
-        if (cached && cached.value.length === unit.chunks.length) {
-          unit.chunks.forEach((chunk, index) => {
-            chunk.translated = cached.value[index];
-            chunk.state = "done";
-          });
-          this.renderUnit(unit);
-        } else if (this.config.cacheEnabled) {
-          for (const chunk of unit.chunks) chunk.state = "unchecked";
+        const unit = this.pendingUnits.get(element) || this.prepareUnit(element, records);
+        if (moving) {
+          this.pendingUnits.set(element, unit);
+          continue;
         }
-        if (!unit.chunks.length) this.renderUnit(unit);
+        this.pendingUnits.delete(element);
+        unit.nodes.forEach((record) => this.ownership.set(record.node, record));
         this.units.set(element, unit);
+        this.renderUnit(unit);
       }
-    });
-    const lookups = [...this.units.values()]
+    };
+    if (moving) reconcile();
+    else this.mutate(reconcile);
+    const lookups = [...this.units.values(), ...this.pendingUnits.values()]
+      .filter((unit) => matchesRecords(unit, groups.get(unit.element)))
       .filter((unit) => !this.scope || this.scope.has(unit.element))
       .sort((first, second) => this.compareUnits(first, second))
       .flatMap((unit) =>
@@ -550,6 +599,7 @@ export class TranslationEngine {
     this.runId = crypto.randomUUID();
     this.dispatchToken = null;
     this.cacheLookups = new Set();
+    this.pendingUnits.clear();
     this.observer.disconnect();
     this.scrollAnchor.stop();
     this.frameObserver?.disconnect();
@@ -750,11 +800,14 @@ export class TranslationEngine {
         retryFragments: tasks.length === 1 && tasks[0].chunk.retryFragments === true,
       });
       if (!this.active || runId !== this.runId) return;
-      const results = new Map(translated.map((item) => [item.id, item.parts]));
+      const results = new Map(translated.map((item) => [item.id, item]));
       this.mutate(() => {
         for (const { unit, chunk } of tasks) {
           if (this.units.get(unit.element) !== unit) continue;
-          chunk.translated = results.get(chunk.id);
+          const result = results.get(chunk.id);
+          chunk.translated = result.parts;
+          // 后台请求前还有一次缓存核对，不能仅因发过 TRANSLATE_BATCH 就算作新翻译。
+          chunk.cacheHit = result.cacheHit === true;
           chunk.state = "done";
           if (unit.chunks.every((item) => item.state === "done")) {
             if (cacheRevision === this.cacheRevision) this.remember(unit);

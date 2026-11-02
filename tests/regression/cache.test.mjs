@@ -112,6 +112,7 @@ test("缓存跨实例复用，仅请求缺项，同批重复去重并使用本�
     translate,
   });
   assert.equal(requests[0].length, 1);
+  assert(first.every((item) => item.cacheHit === false));
   assert.deepEqual(
     first.map((item) => item.id),
     ["old", "duplicate"],
@@ -129,8 +130,12 @@ test("缓存跨实例复用，仅请求缺项，同批重复去重并使用本�
   );
   assert.equal(next[0].id, "new");
   assert.equal(next[0].parts[0], "译文：Read this paragraph.");
+  assert.deepEqual(
+    next.map((item) => item.cacheHit),
+    [true, false],
+  );
   requests = [];
-  await translateWithCache({
+  const disabled = await translateWithCache({
     cache: new TranslationCache(storage),
     settings: { ...settings, cacheEnabled: false },
     segments: [segment("disabled")],
@@ -138,7 +143,33 @@ test("缓存跨实例复用，仅请求缺项，同批重复去重并使用本�
     translate,
   });
   assert.equal(requests.length, 1);
+  assert.equal(disabled[0].cacheHit, false);
   assert.equal((await new TranslationCache(storage).stats()).count, 2);
+  assert(
+    (await new TranslationCache(storage).exportData()).entries.every(
+      (entry) => Object.keys(entry).sort().join() === "key,parts",
+    ),
+  );
+});
+
+test("预检之后写入的缓存由后台二次核对标记为命中，不误报新翻译", async () => {
+  const cache = new TranslationCache(new LocalStorage());
+  const segments = [segment("same")];
+  assert.deepEqual(await lookupCachedTranslations({ cache, settings, segments }), []);
+  await cache.putMany([
+    {
+      key: await cacheKey(publicSettings(settings).signature, segments[0]),
+      parts: ["其他页面刚保存的译文"],
+    },
+  ]);
+  const result = await translateWithCache({
+    cache,
+    settings,
+    segments,
+    signal,
+    translate: async () => assert.fail("已有缓存不应调用翻译接口"),
+  });
+  assert.deepEqual(result, [{ id: "same", parts: ["其他页面刚保存的译文"], cacheHit: true }]);
 });
 
 test("缓存区分端点、模型、语言、上下文与内联分片，不依赖 API Key 或排版", async () => {
@@ -239,7 +270,7 @@ test("清理和停用阻止迟到请求写回缓存，存储故障不丢失成�
     if (action === "disable") cache.invalidate();
     if (action === "failure") storage.failWrite = true;
     release();
-    assert.deepEqual(await pending, [{ id: "pending", parts: ["成功译文"] }]);
+    assert.deepEqual(await pending, [{ id: "pending", parts: ["成功译文"], cacheHit: false }]);
     assert.equal((await cache.stats()).count, 0);
     assert.equal(storage.data.settings.secret, "keep-my-key");
     if (action === "failure") assert(cache.warning.includes("写入失败"));
@@ -309,7 +340,9 @@ for (const broken of [undefined, null, "invalid", [123]]) {
           return [{ id: segments[0].id, parts: ["已修复译文"] }];
         },
       });
-      assert.deepEqual(result, [{ id: `visit-${visit}`, parts: ["已修复译文"] }]);
+      assert.deepEqual(result, [
+        { id: `visit-${visit}`, parts: ["已修复译文"], cacheHit: visit > 0 },
+      ]);
     }
     assert.equal(calls, 1);
     assert.equal((await new TranslationCache(storage).stats()).count, 1);

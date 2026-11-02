@@ -354,7 +354,7 @@ test("变更人名字典隔离持久缓存，旧缓存保留，停用后仍可�
   };
   assert.deepEqual(await lookupCachedTranslations({ cache, settings, segments }), []);
   assert.deepEqual(await translateWithCache({ cache, settings, segments, signal, translate }), [
-    { id: "name", parts: [entry.dst] },
+    { id: "name", parts: [entry.dst], cacheHit: false },
   ]);
   assert.deepEqual(await lookupCachedTranslations({ cache, settings: base, segments }), [
     { id: "name", parts: ["普通译文"] },

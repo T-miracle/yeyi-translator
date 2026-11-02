@@ -250,10 +250,13 @@ test("升级仅隔离日语旧缓存，英文继续命中，新日语可复用�
   };
   const translated = await translateWithCache(options);
   assert.deepEqual(translated, [
-    { id: "ja", parts: ["真的假的？"] },
-    { id: "en", parts: ["欢迎来到开放网络"] },
+    { id: "ja", parts: ["真的假的？"], cacheHit: false },
+    { id: "en", parts: ["欢迎来到开放网络"], cacheHit: true },
   ]);
-  assert.deepEqual(await translateWithCache(options), translated);
+  assert.deepEqual(
+    await translateWithCache(options),
+    translated.map((item) => ({ ...item, cacheHit: true })),
+  );
   assert.equal(calls, 1);
   for (const [key, value] of Object.entries(before)) {
     if (key !== "translationCacheIndexV1") assert.deepEqual(storage.data[key], value);
